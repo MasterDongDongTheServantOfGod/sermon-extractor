@@ -243,3 +243,68 @@ def publish_article(
     _update_index(metadata)
 
     return {"slug": slug, "html_path": f"/articles/{dir_name}/article.html"}
+
+
+def rebuild_article_files(
+    article_id: int,
+    dir_name: str,
+    title: str,
+    deck: str,
+    article_body: str,
+    primary_scripture: str,
+    seo_title: str,
+    meta_description: str,
+    tags: List[str],
+    pastor_name: str,
+    church_name: str,
+    sermon_title: str,
+    video_url: str,
+    thumbnail_url: str,
+    published_date: str,
+    seo_score: int = 0,
+    risk_level: str = "LOW",
+) -> Dict:
+    """Recreate static files for an existing article using its known dir_name."""
+    article_dir = os.path.join("articles", dir_name)
+    os.makedirs(article_dir, exist_ok=True)
+
+    image_relative = ""
+    if thumbnail_url:
+        img_path = os.path.join(article_dir, "image.jpg")
+        if not os.path.exists(img_path):
+            _download_image(thumbnail_url, img_path)
+        if os.path.exists(img_path):
+            image_relative = f"/articles/{dir_name}/image.jpg"
+
+    article_body_html = _body_to_html(article_body)
+    risk_badge = {"LOW": "low", "MEDIUM": "med", "HIGH": "high"}.get(risk_level, "med")
+
+    template = Template(_ARTICLE_HTML)
+    html = template.render(
+        title=title, deck=deck, article_body_html=article_body_html,
+        primary_scripture=primary_scripture, seo_title=seo_title or title,
+        meta_description=meta_description, tags=tags,
+        pastor_name=pastor_name, church_name=church_name,
+        sermon_title=sermon_title, video_url=video_url,
+        image_url=image_relative, published_date=published_date,
+        seo_score=seo_score, risk_level=risk_level, risk_badge=risk_badge,
+    )
+
+    with open(os.path.join(article_dir, "article.html"), "w", encoding="utf-8") as fh:
+        fh.write(html)
+
+    return {
+        "id": article_id,
+        "title": title,
+        "slug": dir_name.split("_", 2)[-1] if dir_name.count("_") >= 2 else dir_name,
+        "primary_scripture": primary_scripture,
+        "pastor_name": pastor_name,
+        "church_name": church_name,
+        "published_date": published_date,
+        "html_path": f"/articles/{dir_name}/article.html",
+        "image_url": image_relative,
+        "tags": tags,
+        "meta_description": meta_description,
+        "seo_score": seo_score,
+        "risk_level": risk_level,
+    }
