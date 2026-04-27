@@ -1,28 +1,4 @@
 {
-  "articles": [
-    {
-      "id": 4,
-      "title": "Justified First, Then Made Holy: Embracing Sanctification as Evidence, Not Cause",
-      "slug": "justified-first-then-made-holy-embracing-sanctification-as-e",
-      "primary_scripture": "Romans 5:1-4",
-      "pastor_name": "John Piper",
-      "church_name": "@desiringGod",
-      "published_date": "April 27, 2026",
-      "html_path": "/articles/20260427_222347_justified-first-then-made-holy-embracing-sanctification-as-e/article.html",
-      "image_url": "/articles/20260427_222347_justified-first-then-made-holy-embracing-sanctification-as-e/image.jpg",
-      "tags": [
-        "justification",
-        "sanctification",
-        "faith alone",
-        "Romans 5",
-        "John Piper",
-        "grace",
-        "Christian living"
-      ],
-      "meta_description": "Explore Pastor John Piper's teaching on how sanctification is the evidence, not the cause, of our justification by faith alone. Learn to embrace God's grace and grow in holiness with confidence.",
-      "seo_score": 70,
-      "risk_level": "LOW"
-    }
-  ],
-  "updated_at": "2026-04-27T22:23:48.328780"
+  "articles": [],
+  "updated_at": "2026-04-27T00:00:00"
 }
