@@ -117,6 +117,17 @@ app.include_router(articles.router, prefix="/api/articles", tags=["Articles"])
 app.mount("/articles", StaticFiles(directory="articles"), name="articles")
 
 
+def _admin_response():
+    response = FileResponse("frontend/index.html")
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.get("/", include_in_schema=False)
 def serve_admin():
-    return FileResponse("frontend/index.html")
+    return _admin_response()
+
+
+@app.get("/generate", include_in_schema=False)
+def serve_generate_page():
+    return _admin_response()

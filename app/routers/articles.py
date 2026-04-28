@@ -1,8 +1,10 @@
 import json
+import os
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session, joinedload
 
@@ -22,8 +24,10 @@ from app.services import (
 router = APIRouter()
 
 CANDIDATE_LIMIT = 20
+COLLECT_MAX_RESULTS = int(os.getenv("YOUTUBE_COLLECT_MAX_RESULTS", "50"))
 PARALLEL_LIMIT = 5
 SUPADATA_FALLBACK_COUNT = 3
+TRANSCRIPT_SCAN_LIMIT = int(os.getenv("TRANSCRIPT_SCAN_LIMIT", "40"))
 
 
 class GenerateRequest(BaseModel):
@@ -92,14 +96,30 @@ def _save_cost(db: Session, article_id: int, model_name: str, result: dict) -> N
         ))
 
 
+def _pipeline_error(message: str, hint: str, **diagnostics):
+    return HTTPException(
+        status_code=422,
+        detail={
+            "message": message,
+            "hint": hint,
+            "diagnostics": diagnostics,
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
 @router.get("/generate", include_in_schema=False)
-def generate_get_hint():
-    from fastapi import HTTPException
-    raise HTTPException(status_code=405, detail="Use POST /api/articles/generate with JSON body {mode, word_count}")
+def generate_get_hint(request: Request):
+    if "text/html" in request.headers.get("accept", ""):
+        return RedirectResponse(url="/#generate", status_code=303)
+    raise HTTPException(
+        status_code=405,
+        detail="Use POST /api/articles/generate with JSON body {mode, word_count}",
+        headers={"Allow": "POST"},
+    )
 
 
 @router.post("/generate")
@@ -113,19 +133,35 @@ def generate_article(data: GenerateRequest, db: Session = Depends(get_db)):
 
     # 2. Collect recent videos from all channels
     all_candidates = []
+    collection_errors = []
     for ch in channels:
         try:
-            raw_videos = youtube_collector.collect_recent_videos(ch.channel_id, max_results=25)
+            raw_videos = youtube_collector.collect_recent_videos(
+                ch.channel_id,
+                max_results=COLLECT_MAX_RESULTS,
+            )
             for v in raw_videos:
                 v["pastor_name"] = ch.pastor_name
                 v["church_name"] = ch.channel_title or ch.pastor_name
                 v["channel_db_id"] = ch.id
             all_candidates.extend(raw_videos)
-        except Exception:
+        except Exception as exc:
+            collection_errors.append({
+                "channel_id": ch.channel_id,
+                "pastor_name": ch.pastor_name,
+                "error": str(exc),
+            })
             continue  # skip failing channels, keep going
 
     if not all_candidates:
-        raise HTTPException(400, "Could not retrieve videos from any registered channel.")
+        raise HTTPException(
+            400,
+            {
+                "message": "Could not retrieve videos from any registered channel.",
+                "hint": "Check that active channels are valid and YOUTUBE_API_KEY is configured.",
+                "diagnostics": {"collection_errors": collection_errors},
+            },
+        )
 
     # 3. Already-published video IDs + failed transcript IDs
     used_video_ids = {
@@ -138,53 +174,84 @@ def generate_article(data: GenerateRequest, db: Session = Depends(get_db)):
 
     # 4. Filter candidates
     filtered = []
+    filter_counts = {
+        "collected": len(all_candidates),
+        "already_used": 0,
+        "previous_transcript_failures": 0,
+        "hard_filter_failures": 0,
+        "usable_candidates": 0,
+    }
+    hard_filter_reasons = {}
     for v in all_candidates:
         vid_id = v["youtube_video_id"]
         if vid_id in used_video_ids:
+            filter_counts["already_used"] += 1
             continue
         if vid_id in failed_ids:
+            filter_counts["previous_transcript_failures"] += 1
             continue
-        ok, _ = scorer.passes_hard_filters(v)
+        ok, reason = scorer.passes_hard_filters(v)
         if not ok:
+            filter_counts["hard_filter_failures"] += 1
+            hard_filter_reasons[reason] = hard_filter_reasons.get(reason, 0) + 1
             continue
         is_new = not db.query(Video).filter(Video.youtube_video_id == vid_id).first()
         v["is_new"] = is_new
         v["computed_score"] = scorer.score_video(v, is_new=is_new)
         filtered.append(v)
+    filter_counts["usable_candidates"] = len(filtered)
 
     if not filtered:
-        raise HTTPException(422, "No suitable video candidates after filtering. Try adding more channels or wait for new uploads.")
+        raise _pipeline_error(
+            "No suitable video candidates after filtering.",
+            "Add another active channel, wait for new uploads, or increase YOUTUBE_COLLECT_MAX_RESULTS.",
+            filter_counts=filter_counts,
+            hard_filter_reasons=hard_filter_reasons,
+            collection_errors=collection_errors,
+        )
 
-    # 5. Sort by score → top 20
+    # 5. Sort by score and scan enough candidates to survive missing captions.
     filtered.sort(key=lambda x: x["computed_score"], reverse=True)
-    top = filtered[:CANDIDATE_LIMIT]
-    top_ids = [v["youtube_video_id"] for v in top]
-
-    # 6. Parallel transcript extraction (cheap methods, 5 at a time)
-    transcripts = transcript_extractor.extract_transcripts_parallel(top_ids, max_concurrent=PARALLEL_LIMIT)
-
-    # 7. Pick first successful transcript (by score order)
+    transcript_candidates = filtered[:TRANSCRIPT_SCAN_LIMIT]
     selected_video = None
     selected_transcript = None
     selected_type = None
-    for candidate in top:
-        if candidate["youtube_video_id"] in transcripts:
-            selected_video = candidate
-            selected_transcript, selected_type = transcripts[candidate["youtube_video_id"]]
+    transcript_attempted = []
+
+    # 6-8. Try cheap transcript extraction in scored batches; use Supadata per batch.
+    for start in range(0, len(transcript_candidates), CANDIDATE_LIMIT):
+        batch = transcript_candidates[start:start + CANDIDATE_LIMIT]
+        batch_ids = [v["youtube_video_id"] for v in batch]
+        transcript_attempted.extend(batch_ids)
+
+        transcripts = transcript_extractor.extract_transcripts_parallel(
+            batch_ids,
+            max_concurrent=PARALLEL_LIMIT,
+        )
+
+        for candidate in batch:
+            if candidate["youtube_video_id"] in transcripts:
+                selected_video = candidate
+                selected_transcript, selected_type = transcripts[candidate["youtube_video_id"]]
+                break
+
+        if selected_video:
             break
 
-    # 8. Supadata fallback for top 3
-    if not selected_video:
-        fallback_results = transcript_extractor.extract_supadata_batch(top_ids[:SUPADATA_FALLBACK_COUNT])
-        for candidate in top[:SUPADATA_FALLBACK_COUNT]:
+        fallback_ids = batch_ids[:SUPADATA_FALLBACK_COUNT]
+        fallback_results = transcript_extractor.extract_supadata_batch(fallback_ids)
+        for candidate in batch[:SUPADATA_FALLBACK_COUNT]:
             if candidate["youtube_video_id"] in fallback_results:
                 selected_video = candidate
                 selected_transcript, selected_type = fallback_results[candidate["youtube_video_id"]]
                 break
 
+        if selected_video:
+            break
+
     # 9. No transcript found → record failures and bail
     if not selected_video or not selected_transcript:
-        for candidate in top[:5]:
+        for candidate in transcript_candidates[:5]:
             vid_id = candidate["youtube_video_id"]
             existing = db.query(FailedTranscript).filter(FailedTranscript.youtube_video_id == vid_id).first()
             if not existing:
@@ -193,7 +260,14 @@ def generate_article(data: GenerateRequest, db: Session = Depends(get_db)):
                     reason="No usable transcript found from any method",
                 ))
         db.commit()
-        raise HTTPException(422, "No usable transcript found for any candidate video.")
+        raise _pipeline_error(
+            "No usable transcript found for any candidate video.",
+            "Try again later, add channels with English captions, or configure SUPADATA_API_KEY for fallback transcripts.",
+            filter_counts=filter_counts,
+            transcript_candidates=len(transcript_candidates),
+            transcript_attempted=transcript_attempted,
+            supadata_enabled=bool(transcript_extractor.SUPADATA_API_KEY),
+        )
 
     # 10. Save / update video record
     video_record = db.query(Video).filter(

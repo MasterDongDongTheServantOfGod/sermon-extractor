@@ -353,19 +353,35 @@
 // ===== State =====
 let currentArticleId = null;
 let currentPage = 'channels';
+const PAGES = ['channels', 'generate', 'articles'];
 
 // ===== Navigation =====
+function showPage(page, updateHash = true) {
+  if (!PAGES.includes(page)) page = 'channels';
+
+  document.querySelectorAll('.nav-item').forEach(x => x.classList.remove('active'));
+  document.querySelectorAll('.page').forEach(x => x.classList.remove('active'));
+
+  const nav = document.querySelector(`.nav-item[data-page="${page}"]`);
+  const pageEl = document.getElementById('page-' + page);
+  if (nav) nav.classList.add('active');
+  if (pageEl) pageEl.classList.add('active');
+
+  currentPage = page;
+  if (updateHash && window.location.hash !== '#' + page) {
+    history.replaceState(null, '', '#' + page);
+  }
+
+  if (page === 'channels') loadChannels();
+  if (page === 'articles') loadArticles();
+}
+
 document.querySelectorAll('.nav-item').forEach(el => {
-  el.addEventListener('click', () => {
-    document.querySelectorAll('.nav-item').forEach(x => x.classList.remove('active'));
-    document.querySelectorAll('.page').forEach(x => x.classList.remove('active'));
-    el.classList.add('active');
-    const page = el.dataset.page;
-    document.getElementById('page-' + page).classList.add('active');
-    currentPage = page;
-    if (page === 'channels') loadChannels();
-    if (page === 'articles') loadArticles();
-  });
+  el.addEventListener('click', () => showPage(el.dataset.page));
+});
+
+window.addEventListener('hashchange', () => {
+  showPage((window.location.hash || '').slice(1), false);
 });
 
 // ===== Helpers =====
@@ -393,6 +409,36 @@ function showAlert(id, msg, type='error') {
   if (!el) return;
   el.innerHTML = `<div class="alert alert-${type}">${msg}</div>`;
   setTimeout(() => { el.innerHTML = ''; }, 5000);
+}
+function formatApiError(payload, fallback='Pipeline failed.') {
+  const detail = payload?.detail ?? payload;
+  if (!detail) return fallback;
+  if (typeof detail === 'string') return esc(detail);
+  if (Array.isArray(detail)) {
+    return detail.map(item => esc(item?.msg || JSON.stringify(item))).join('<br>');
+  }
+  if (typeof detail === 'object') {
+    const parts = [];
+    if (detail.message) parts.push(`<strong>${esc(detail.message)}</strong>`);
+    if (detail.hint) parts.push(esc(detail.hint));
+    if (detail.diagnostics) {
+      parts.push(`<pre style="white-space:pre-wrap;margin-top:8px;font-size:0.82em;">${esc(JSON.stringify(detail.diagnostics, null, 2))}</pre>`);
+    }
+    return parts.length ? parts.join('<br>') : esc(JSON.stringify(detail));
+  }
+  return esc(String(detail));
+}
+async function readApiError(res, fallback='Pipeline failed.') {
+  try {
+    return formatApiError(await res.json(), fallback);
+  } catch {
+    return `${fallback} (${res.status})`;
+  }
+}
+function setGenerateBusy(isBusy) {
+  document.querySelectorAll('.btn-news, .btn-blog').forEach(btn => {
+    btn.disabled = isBusy;
+  });
 }
 
 // ===== CHANNELS =====
@@ -488,6 +534,7 @@ async function generateArticle(mode) {
   document.getElementById('gen-preview').classList.remove('show');
   document.getElementById('gen-error').innerHTML = '';
   document.getElementById('gen-step').textContent = LOADING_STEPS[0];
+  setGenerateBusy(true);
   animateSteps();
 
   try {
@@ -499,11 +546,12 @@ async function generateArticle(mode) {
 
     clearInterval(stepTimer);
     document.getElementById('gen-loading').classList.remove('show');
+    setGenerateBusy(false);
 
     if (!res.ok) {
-      const err = await res.json();
+      const message = await readApiError(res);
       document.getElementById('gen-error').innerHTML =
-        `<div class="alert alert-error">❌ ${err.detail || 'Pipeline failed.'}</div>`;
+        `<div class="alert alert-error">❌ ${message}</div>`;
       return;
     }
 
@@ -514,6 +562,7 @@ async function generateArticle(mode) {
   } catch (e) {
     clearInterval(stepTimer);
     document.getElementById('gen-loading').classList.remove('show');
+    setGenerateBusy(false);
     document.getElementById('gen-error').innerHTML =
       `<div class="alert alert-error">❌ Network error: ${e.message}</div>`;
   }
@@ -727,7 +776,9 @@ function esc(str) {
 }
 
 // ===== Init =====
-loadChannels();
+const pathPage = window.location.pathname === '/generate' ? 'generate' : '';
+const initialPage = (window.location.hash || '').slice(1) || pathPage || currentPage;
+showPage(initialPage, false);
 </script>
 </body>
 </html>
