@@ -113,11 +113,15 @@ def _pipeline_error(message: str, hint: str, **diagnostics):
 
 @router.get("/generate", include_in_schema=False)
 def generate_get_hint(request: Request):
-    if "text/html" in request.headers.get("accept", ""):
+    accept = request.headers.get("accept", "")
+    if "application/json" not in accept:
         return RedirectResponse(url="/#generate", status_code=303)
     raise HTTPException(
         status_code=405,
-        detail="Use POST /api/articles/generate with JSON body {mode, word_count}",
+        detail={
+            "message": "Article generation requires a POST request.",
+            "hint": "Use POST /api/articles/generate with JSON body {mode, word_count}.",
+        },
         headers={"Allow": "POST"},
     )
 
