@@ -23,14 +23,10 @@ from app.services import (
 
 router = APIRouter()
 
-CANDIDATE_LIMIT = 10
 COLLECT_MAX_RESULTS = int(os.getenv("YOUTUBE_COLLECT_MAX_RESULTS", "50"))
-PARALLEL_LIMIT = 2
-SUPADATA_FIRST_COUNT = 3
-YTDLP_FALLBACK_COUNT = 3
 TRANSCRIPT_SCAN_LIMIT = max(
     1,
-    min(int(os.getenv("TRANSCRIPT_SCAN_LIMIT", str(CANDIDATE_LIMIT))), CANDIDATE_LIMIT),
+    min(int(os.getenv("TRANSCRIPT_SCAN_LIMIT", "50")), 50),
 )
 
 
@@ -223,7 +219,9 @@ def generate_article(data: GenerateRequest, db: Session = Depends(get_db)):
         for v in db.query(Video).filter(Video.articles.any()).all()
     }
     failed_ids = {
-        f.youtube_video_id for f in db.query(FailedTranscript).all()
+        f.youtube_video_id
+        for f in db.query(FailedTranscript).all()
+        if transcript_extractor.is_video_level_transcript_failure(f.reason)
     }
 
     # 4. Filter candidates
@@ -270,67 +268,66 @@ def generate_article(data: GenerateRequest, db: Session = Depends(get_db)):
     selected_video = None
     selected_transcript = None
     selected_type = None
-    transcript_attempted = []
     supadata_enabled = bool(transcript_extractor.SUPADATA_API_KEY)
     youtube_cookies_enabled = bool(transcript_extractor.getYoutubeCookiesPath())
 
     print(f"[Transcript] candidate count: {len(transcript_candidates)}", flush=True)
-    print(f"[Transcript] parallel limit: {PARALLEL_LIMIT}", flush=True)
-    print(f"[Transcript] timeout seconds: {transcript_extractor.TRANSCRIPT_TIMEOUT}", flush=True)
     print(f"[Transcript] Supadata enabled: {str(supadata_enabled).lower()}", flush=True)
 
-    # 6-8. Try transcript extraction in scored batches. Supadata runs first when configured.
-    for start in range(0, len(transcript_candidates), CANDIDATE_LIMIT):
-        batch = transcript_candidates[start:start + CANDIDATE_LIMIT]
-        batch_ids = [v["youtube_video_id"] for v in batch]
-        transcript_attempted.extend(batch_ids)
-
-        transcripts = transcript_extractor.extract_transcripts_parallel(
-            batch_ids,
-            max_concurrent=PARALLEL_LIMIT,
-            supadata_limit=SUPADATA_FIRST_COUNT,
-            ytdlp_limit=YTDLP_FALLBACK_COUNT,
+    # 6-8. Automatically try Fast Mode, then Deep Mode when the fast pass fails.
+    transcript_result = transcript_extractor.extract_transcript_auto(
+        transcript_candidates,
+        content_type=data.mode,
+    )
+    if transcript_result.get("ok"):
+        selected_video = next(
+            (
+                candidate
+                for candidate in transcript_candidates
+                if candidate["youtube_video_id"] == transcript_result["video_id"]
+            ),
+            None,
         )
-
-        for candidate in batch:
-            if candidate["youtube_video_id"] in transcripts:
-                selected_video = candidate
-                selected_transcript, selected_type = transcripts[candidate["youtube_video_id"]]
-                break
-
-        if selected_video:
-            break
+        selected_transcript = transcript_result["transcript"]
+        selected_type = transcript_result.get("transcript_type") or transcript_result.get("provider")
 
     # 9. No transcript found → record failures and bail
     if not selected_video or not selected_transcript:
+        transcript_attempted = transcript_result.get(
+            "attempted_video_ids",
+            [v["youtube_video_id"] for v in transcript_candidates],
+        )
         failure_reasons = transcript_extractor.getTranscriptFailureReasons(transcript_attempted)
         failure_reason_counts = {}
         for reason in failure_reasons.values():
             failure_reason_counts[reason] = failure_reason_counts.get(reason, 0) + 1
-        primary_failure = _primary_transcript_failure(failure_reason_counts)
+        primary_failure = transcript_result.get("reason", "no_usable_transcript_found")
         provider_diagnostics = transcript_extractor.getTranscriptProviderDiagnostics()
 
-        for candidate in transcript_candidates[:5]:
-            vid_id = candidate["youtube_video_id"]
+        video_failures = {}
+        for stats_key in ["fast_stats", "deep_stats"]:
+            stats = transcript_result.get(stats_key) or {}
+            video_failures.update(stats.get("video_failures", {}))
+
+        for vid_id, reason in video_failures.items():
             existing = db.query(FailedTranscript).filter(FailedTranscript.youtube_video_id == vid_id).first()
             if not existing:
                 db.add(FailedTranscript(
                     youtube_video_id=vid_id,
-                    reason=primary_failure,
+                    reason=reason,
                 ))
         db.commit()
         raise _pipeline_error(
-            _transcript_failure_message(primary_failure),
-            _transcript_failure_hint(
-                primary_failure,
-                supadata_enabled=supadata_enabled,
-                youtube_cookies_enabled=youtube_cookies_enabled,
-            ),
+            "No usable transcript found.",
+            "Fast and deep transcript extraction failed. See diagnostics for provider-level failure stats.",
             filter_counts=filter_counts,
             transcript_candidates=len(transcript_candidates),
             transcript_attempted=transcript_attempted,
             transcript_failure_reason=primary_failure,
             transcript_failure_reason_counts=failure_reason_counts,
+            fast_stats=transcript_result.get("fast_stats"),
+            deep_attempted=transcript_result.get("deep_attempted", False),
+            deep_stats=transcript_result.get("deep_stats"),
             supadata_status_counts=provider_diagnostics["supadata_status_counts"],
             supadata_failure_reason_counts=provider_diagnostics["supadata_failure_reason_counts"],
             provider_attempt_counts=provider_diagnostics["provider_attempt_counts"],

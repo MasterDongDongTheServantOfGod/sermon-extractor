@@ -505,23 +505,29 @@ async function deleteChannel(id) {
 }
 
 // ===== GENERATE =====
-const LOADING_STEPS = [
-  'Collecting recent videos from channels…',
-  'Scoring and filtering candidates…',
-  'Extracting transcript (parallel, 5 at a time)…',
-  'Summarizing with Gemini Flash Lite…',
-  'Writing article with GPT-4.1-mini…',
-  'Running SEO scorer…',
-  'Running risk review…',
-  'Saving to database…'
-];
+function loadingSteps(mode) {
+  return [
+    'Collecting recent videos from channels…',
+    'Scoring and filtering candidates…',
+    'Finding a sermon with usable transcript…',
+    'Standard transcript search failed. Trying deeper extraction…',
+    mode === 'blog'
+      ? 'Transcript found. Generating blog…'
+      : 'Transcript found. Generating news article…',
+    'Summarizing with Gemini Flash Lite…',
+    'Writing article with GPT-4.1-mini…',
+    'Running SEO scorer…',
+    'Running risk review…',
+    'Saving to database…'
+  ];
+}
 let stepTimer = null;
 
-function animateSteps() {
+function animateSteps(steps) {
   let i = 0;
   stepTimer = setInterval(() => {
-    if (i < LOADING_STEPS.length) {
-      document.getElementById('gen-step').textContent = LOADING_STEPS[i];
+    if (i < steps.length) {
+      document.getElementById('gen-step').textContent = steps[i];
       i++;
     }
   }, 5000);
@@ -529,13 +535,14 @@ function animateSteps() {
 
 async function generateArticle(mode) {
   const wordCount = parseInt(document.getElementById('gen-wordcount').value) || 500;
+  const steps = loadingSteps(mode);
 
   document.getElementById('gen-loading').classList.add('show');
   document.getElementById('gen-preview').classList.remove('show');
   document.getElementById('gen-error').innerHTML = '';
-  document.getElementById('gen-step').textContent = LOADING_STEPS[0];
+  document.getElementById('gen-step').textContent = steps[0];
   setGenerateBusy(true);
-  animateSteps();
+  animateSteps(steps);
 
   try {
     const res = await fetch('/api/articles/generate', {
