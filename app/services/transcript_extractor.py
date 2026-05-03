@@ -17,6 +17,7 @@ load_dotenv()
 
 SUPADATA_API_KEY = os.getenv("SUPADATA_API_KEY", "")
 TRANSCRIPT_TIMEOUT = 8  # seconds per provider attempt
+SUPADATA_TIMEOUT = 5
 _YT_COOKIES_PATH = "/tmp/youtube-cookies.txt"
 YT_COOKIES_PATH = _YT_COOKIES_PATH
 
@@ -29,9 +30,14 @@ logger = logging.getLogger(__name__)
 _cookies_lock = threading.Lock()
 _cookies_initialized = False
 _cookies_path_cache: Optional[str] = None
+_cookies_invalid_format_logged = False
 
 _failure_lock = threading.Lock()
 _last_failure_reasons: Dict[str, str] = {}
+_provider_attempt_counts: Dict[str, int] = {}
+_provider_timeout_counts: Dict[str, int] = {}
+_supadata_status_counts: Dict[str, int] = {}
+_supadata_failure_reason_counts: Dict[str, int] = {}
 _FAILURE_PRIORITY = {
     FAILURE_TRANSCRIPT_NOT_AVAILABLE: 1,
     FAILURE_TRANSCRIPT_TIMEOUT: 2,
@@ -99,6 +105,41 @@ def getYoutubeCookiesPath() -> Optional[str]:
     return get_youtube_cookies_path()
 
 
+def _log_invalid_netscape_cookie_format() -> None:
+    global _cookies_invalid_format_logged
+    with _cookies_lock:
+        if _cookies_invalid_format_logged:
+            return
+        _cookies_invalid_format_logged = True
+    print("[YT Cookies] invalid Netscape format", flush=True)
+
+
+def is_youtube_cookiefile_valid(log_invalid: bool = True) -> bool:
+    cookies_path = get_youtube_cookies_path()
+    if not cookies_path:
+        return False
+
+    try:
+        with open(cookies_path, "r", encoding="utf-8", errors="replace") as fh:
+            first_line = fh.readline(256)
+    except OSError:
+        if log_invalid:
+            _log_invalid_netscape_cookie_format()
+        return False
+
+    is_valid = "Netscape HTTP Cookie File" in first_line
+    if not is_valid and log_invalid:
+        _log_invalid_netscape_cookie_format()
+    return is_valid
+
+
+def _get_ytdlp_cookiefile() -> Optional[str]:
+    cookies_path = get_youtube_cookies_path()
+    if not cookies_path:
+        return None
+    return cookies_path if is_youtube_cookiefile_valid() else None
+
+
 def _is_bot_verification_error(exc: Exception) -> bool:
     message = str(exc).lower()
     return (
@@ -122,6 +163,49 @@ def _record_failure(video_id: str, reason: str) -> None:
         existing = _last_failure_reasons.get(video_id)
         if not existing or _FAILURE_PRIORITY.get(reason, 0) >= _FAILURE_PRIORITY.get(existing, 0):
             _last_failure_reasons[video_id] = reason
+
+
+def _increment_counter(counter: Dict[str, int], key: str) -> None:
+    with _failure_lock:
+        counter[key] = counter.get(key, 0) + 1
+
+
+def _record_provider_attempt(provider: str) -> None:
+    _increment_counter(_provider_attempt_counts, provider)
+
+
+def _record_provider_timeout(provider: str) -> None:
+    _increment_counter(_provider_timeout_counts, provider)
+
+
+def _record_supadata_status(status_code: int) -> None:
+    _increment_counter(_supadata_status_counts, str(status_code))
+
+
+def _record_supadata_failure(reason: str) -> None:
+    _increment_counter(_supadata_failure_reason_counts, reason)
+
+
+def resetTranscriptProviderDiagnostics() -> None:
+    with _failure_lock:
+        _provider_attempt_counts.clear()
+        _provider_timeout_counts.clear()
+        _supadata_status_counts.clear()
+        _supadata_failure_reason_counts.clear()
+
+
+def getTranscriptProviderDiagnostics() -> Dict[str, Dict[str, int]]:
+    with _failure_lock:
+        return {
+            "supadata_status_counts": dict(_supadata_status_counts),
+            "supadata_failure_reason_counts": dict(_supadata_failure_reason_counts),
+            "provider_attempt_counts": dict(_provider_attempt_counts),
+            "provider_timeout_counts": dict(_provider_timeout_counts),
+        }
+
+
+def get_transcript_provider_diagnostics() -> Dict[str, Dict[str, int]]:
+    return getTranscriptProviderDiagnostics()
 
 
 def getTranscriptFailureReasons(video_ids: Optional[List[str]] = None) -> Dict[str, str]:
@@ -185,6 +269,7 @@ def _extract_via_transcript_api(video_id: str) -> Optional[Tuple[str, str]]:
         if reason == FAILURE_BOT_VERIFICATION:
             logger.warning("%s for video_id=%s", reason, video_id)
         elif reason == FAILURE_TRANSCRIPT_TIMEOUT:
+            _record_provider_timeout("youtube_transcript_api")
             print(f"[Transcript] timeout: video_id={video_id}", flush=True)
         else:
             print(f"[Transcript] not available: video_id={video_id}", flush=True)
@@ -211,7 +296,7 @@ def _extract_via_ytdlp(video_id: str) -> Optional[Tuple[str, str]]:
                 "socket_timeout": TRANSCRIPT_TIMEOUT,
             }
 
-            cookies_path = get_youtube_cookies_path()
+            cookies_path = _get_ytdlp_cookiefile()
             if cookies_path:
                 ydl_opts["cookiefile"] = cookies_path
             print(f"[Transcript] yt-dlp cookies enabled: {_bool_text(cookies_path)}", flush=True)
@@ -227,6 +312,7 @@ def _extract_via_ytdlp(video_id: str) -> Optional[Tuple[str, str]]:
                 if reason == FAILURE_BOT_VERIFICATION:
                     print(f"[Transcript] yt-dlp bot verification blocked: video_id={video_id}", flush=True)
                 elif reason == FAILURE_TRANSCRIPT_TIMEOUT:
+                    _record_provider_timeout("yt_dlp")
                     print(f"[Transcript] timeout: video_id={video_id}", flush=True)
                 else:
                     print(f"[Transcript] extraction failed: video_id={video_id} error={type(exc).__name__}", flush=True)
@@ -268,6 +354,7 @@ def _extract_via_ytdlp(video_id: str) -> Optional[Tuple[str, str]]:
         if reason == FAILURE_BOT_VERIFICATION:
             print(f"[Transcript] yt-dlp bot verification blocked: video_id={video_id}", flush=True)
         elif reason == FAILURE_TRANSCRIPT_TIMEOUT:
+            _record_provider_timeout("yt_dlp")
             print(f"[Transcript] timeout: video_id={video_id}", flush=True)
         else:
             print(f"[Transcript] extraction failed: video_id={video_id} error={type(exc).__name__}", flush=True)
@@ -280,27 +367,58 @@ def _extract_via_supadata(video_id: str) -> Optional[Tuple[str, str]]:
     if not SUPADATA_API_KEY:
         return None
     try:
-        with httpx.Client(timeout=TRANSCRIPT_TIMEOUT) as client:
+        with httpx.Client(timeout=SUPADATA_TIMEOUT) as client:
             resp = client.get(
                 "https://api.supadata.ai/v1/youtube/transcript",
                 params={"videoId": video_id, "lang": "en"},
                 headers={"x-api-key": SUPADATA_API_KEY},
             )
-            if resp.status_code == 200:
+            status_code = resp.status_code
+            _record_supadata_status(status_code)
+            print(f"[Supadata] status_code={status_code} video_id={video_id}", flush=True)
+
+            if status_code == 200:
                 payload = resp.json()
                 content = payload.get("content", [])
                 if isinstance(content, list):
                     text = " ".join(item.get("text", "") for item in content).strip()
                 else:
                     text = str(content).strip()
-                return (text, "fallback") if text else None
+                if text:
+                    print(f"[Supadata] success: video_id={video_id}", flush=True)
+                    return text, "fallback"
+                _record_supadata_failure("no_transcript_content")
+                _record_failure(video_id, FAILURE_TRANSCRIPT_NOT_AVAILABLE)
+                print(f"[Supadata] no transcript content: video_id={video_id}", flush=True)
+                return None
+
+            if status_code == 401:
+                _record_supadata_failure("unauthorized_or_invalid_api_key")
+                print("[Supadata] unauthorized or invalid API key", flush=True)
+            elif status_code == 403:
+                _record_supadata_failure("forbidden_quota_or_payment_issue")
+                print("[Supadata] forbidden, quota, or payment issue", flush=True)
+            elif status_code == 429:
+                _record_supadata_failure("rate_limit_or_quota_exceeded")
+                print("[Supadata] rate limit or quota exceeded", flush=True)
+            else:
+                _record_supadata_failure(f"http_{status_code}")
+                print(f"[Supadata] failed: status_code={status_code}", flush=True)
             _record_failure(video_id, FAILURE_TRANSCRIPT_NOT_AVAILABLE)
+    except httpx.TimeoutException:
+        _record_provider_timeout("supadata")
+        _record_supadata_failure("timeout")
+        _record_failure(video_id, FAILURE_TRANSCRIPT_TIMEOUT)
+        print(f"[Supadata] timeout: video_id={video_id}", flush=True)
     except Exception as exc:
         reason = _classify_error(exc)
         _record_failure(video_id, reason)
         if reason == FAILURE_TRANSCRIPT_TIMEOUT:
+            _record_provider_timeout("supadata")
+            _record_supadata_failure("timeout")
             print(f"[Transcript] timeout: video_id={video_id} provider=supadata", flush=True)
         else:
+            _record_supadata_failure(f"error_{type(exc).__name__}")
             print(
                 f"[Transcript] extraction failed: video_id={video_id} "
                 f"provider=supadata error={type(exc).__name__}",
@@ -338,6 +456,7 @@ def _run_provider_with_timeout(
     method,
     video_id: str,
 ) -> Optional[Tuple[str, str]]:
+    _record_provider_attempt(provider)
     result_holder: List[Optional[Tuple[str, str]]] = [None]
     exc_holder: List[Optional[Exception]] = [None]
 
@@ -353,6 +472,9 @@ def _run_provider_with_timeout(
 
     if t.is_alive():
         _record_failure(video_id, FAILURE_TRANSCRIPT_TIMEOUT)
+        _record_provider_timeout(provider)
+        if provider == "supadata":
+            _record_supadata_failure("timeout")
         print(f"[Transcript] timeout: video_id={video_id} provider={provider}", flush=True)
         return None
 
@@ -362,6 +484,9 @@ def _run_provider_with_timeout(
         if reason == FAILURE_BOT_VERIFICATION:
             print(f"[Transcript] yt-dlp bot verification blocked: video_id={video_id}", flush=True)
         elif reason == FAILURE_TRANSCRIPT_TIMEOUT:
+            _record_provider_timeout(provider)
+            if provider == "supadata":
+                _record_supadata_failure("timeout")
             print(f"[Transcript] timeout: video_id={video_id} provider={provider}", flush=True)
         else:
             print(
@@ -443,6 +568,7 @@ def extract_transcripts_parallel(
     video_ids: List[str],
     max_concurrent: int = 5,
     supadata_limit: Optional[int] = None,
+    ytdlp_limit: Optional[int] = None,
 ) -> Dict[str, Tuple[str, str]]:
     """
     Extract transcripts for scored videos. Returns after the first provider success.
@@ -452,6 +578,7 @@ def extract_transcripts_parallel(
     with _failure_lock:
         for vid_id in video_ids:
             _last_failure_reasons.pop(vid_id, None)
+    resetTranscriptProviderDiagnostics()
 
     print(f"[Transcript] candidate count: {len(video_ids)}", flush=True)
     print(f"[Transcript] parallel limit: {max_concurrent}", flush=True)
@@ -460,6 +587,7 @@ def extract_transcripts_parallel(
 
     if SUPADATA_API_KEY:
         supadata_ids = video_ids[:supadata_limit] if supadata_limit else video_ids
+        print(f"[Transcript] Supadata candidate count: {len(supadata_ids)}", flush=True)
         results = _extract_provider_parallel(
             supadata_ids,
             "supadata",
@@ -471,11 +599,16 @@ def extract_transcripts_parallel(
 
     for provider, method in [
         ("youtube_transcript_api", _extract_via_transcript_api),
-        ("yt_dlp", _extract_via_ytdlp),
     ]:
         results = _extract_provider_parallel(video_ids, provider, method, max_concurrent)
         if results:
             return results
+
+    ytdlp_ids = video_ids[:ytdlp_limit] if ytdlp_limit else video_ids
+    print(f"[Transcript] yt-dlp candidate count: {len(ytdlp_ids)}", flush=True)
+    results = _extract_provider_parallel(ytdlp_ids, "yt_dlp", _extract_via_ytdlp, max_concurrent)
+    if results:
+        return results
 
     return results
 
@@ -484,6 +617,7 @@ def extract_supadata_batch(video_ids: List[str]) -> Dict[str, Tuple[str, str]]:
     """Try Supadata for a list of video IDs. Returns successes."""
     results: Dict[str, Tuple[str, str]] = {}
     for vid_id in video_ids:
+        _record_provider_attempt("supadata")
         result = _extract_via_supadata(vid_id)
         if result:
             _log_provider_success("supadata", vid_id)

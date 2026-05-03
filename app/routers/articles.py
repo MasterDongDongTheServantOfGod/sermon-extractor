@@ -26,7 +26,8 @@ router = APIRouter()
 CANDIDATE_LIMIT = 10
 COLLECT_MAX_RESULTS = int(os.getenv("YOUTUBE_COLLECT_MAX_RESULTS", "50"))
 PARALLEL_LIMIT = 2
-SUPADATA_FALLBACK_COUNT = 10
+SUPADATA_FIRST_COUNT = 3
+YTDLP_FALLBACK_COUNT = 3
 TRANSCRIPT_SCAN_LIMIT = max(
     1,
     min(int(os.getenv("TRANSCRIPT_SCAN_LIMIT", str(CANDIDATE_LIMIT))), CANDIDATE_LIMIT),
@@ -287,7 +288,8 @@ def generate_article(data: GenerateRequest, db: Session = Depends(get_db)):
         transcripts = transcript_extractor.extract_transcripts_parallel(
             batch_ids,
             max_concurrent=PARALLEL_LIMIT,
-            supadata_limit=SUPADATA_FALLBACK_COUNT,
+            supadata_limit=SUPADATA_FIRST_COUNT,
+            ytdlp_limit=YTDLP_FALLBACK_COUNT,
         )
 
         for candidate in batch:
@@ -306,6 +308,7 @@ def generate_article(data: GenerateRequest, db: Session = Depends(get_db)):
         for reason in failure_reasons.values():
             failure_reason_counts[reason] = failure_reason_counts.get(reason, 0) + 1
         primary_failure = _primary_transcript_failure(failure_reason_counts)
+        provider_diagnostics = transcript_extractor.getTranscriptProviderDiagnostics()
 
         for candidate in transcript_candidates[:5]:
             vid_id = candidate["youtube_video_id"]
@@ -328,8 +331,15 @@ def generate_article(data: GenerateRequest, db: Session = Depends(get_db)):
             transcript_attempted=transcript_attempted,
             transcript_failure_reason=primary_failure,
             transcript_failure_reason_counts=failure_reason_counts,
+            supadata_status_counts=provider_diagnostics["supadata_status_counts"],
+            supadata_failure_reason_counts=provider_diagnostics["supadata_failure_reason_counts"],
+            provider_attempt_counts=provider_diagnostics["provider_attempt_counts"],
+            provider_timeout_counts=provider_diagnostics["provider_timeout_counts"],
             supadata_enabled=supadata_enabled,
             youtube_cookies_enabled=youtube_cookies_enabled,
+            youtube_cookies_valid_for_ytdlp=transcript_extractor.is_youtube_cookiefile_valid(
+                log_invalid=False,
+            ),
         )
 
     # 10. Save / update video record
