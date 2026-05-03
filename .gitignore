@@ -3,6 +3,7 @@
 cookies.txt
 youtube-cookies.txt
 *-cookies.txt
+*.cookies.txt
 
 # Database
 *.db

@@ -1,11 +1,9 @@
 import base64
-import binascii
 import json
 import glob
 import logging
 import os
-import subprocess
-import sys
+import stat
 import tempfile
 import threading
 from pathlib import Path
@@ -19,8 +17,8 @@ load_dotenv()
 
 SUPADATA_API_KEY = os.getenv("SUPADATA_API_KEY", "")
 TRANSCRIPT_TIMEOUT = 20  # seconds per extraction attempt
-YT_COOKIES_ENV = "YT_COOKIES_BASE64"
-YT_COOKIES_PATH = "/tmp/youtube-cookies.txt"
+_YT_COOKIES_PATH = "/tmp/youtube-cookies.txt"
+YT_COOKIES_PATH = _YT_COOKIES_PATH
 
 FAILURE_BOT_VERIFICATION = "YouTube bot verification blocked yt-dlp access"
 FAILURE_TRANSCRIPT_NOT_AVAILABLE = "Transcript not available"
@@ -45,7 +43,7 @@ def _bool_text(value: object) -> str:
     return "true" if value else "false"
 
 
-def getYoutubeCookiesPath() -> Optional[str]:
+def get_youtube_cookies_path() -> Optional[str]:
     """
     Decode Render-provided YouTube cookies into a temporary cookies.txt file.
 
@@ -58,14 +56,15 @@ def getYoutubeCookiesPath() -> Optional[str]:
         if _cookies_initialized:
             return _cookies_path_cache
 
-        encoded = os.getenv(YT_COOKIES_ENV, "").strip().strip('"').strip("'")
+        encoded = os.getenv("YT_COOKIES_BASE64")
         if not encoded:
             _cookies_initialized = True
             _cookies_path_cache = None
-            logger.warning("YouTube cookies enabled: false (%s not set)", YT_COOKIES_ENV)
+            print("[YT Cookies] enabled: false", flush=True)
             return None
 
         try:
+            encoded = encoded.strip().strip('"').strip("'")
             if "," in encoded and encoded.lower().startswith("data:"):
                 encoded = encoded.split(",", 1)[1]
             normalized = "".join(encoded.split())
@@ -73,56 +72,31 @@ def getYoutubeCookiesPath() -> Optional[str]:
             if not cookies_bytes.strip():
                 raise ValueError("decoded cookies file is empty")
 
-            cookies_path = Path(YT_COOKIES_PATH)
+            cookies_path = Path(_YT_COOKIES_PATH)
             cookies_path.parent.mkdir(parents=True, exist_ok=True)
             cookies_path.write_bytes(cookies_bytes)
             try:
-                os.chmod(cookies_path, 0o600)
+                os.chmod(cookies_path, stat.S_IRUSR | stat.S_IWUSR)
             except OSError:
-                logger.warning("YouTube cookies file permissions could not be set to 600")
+                pass
 
             _cookies_path_cache = str(cookies_path)
             _cookies_initialized = True
-            logger.warning("YouTube cookies enabled: true")
+            print("[YT Cookies] enabled: true", flush=True)
+            print("[YT Cookies] file created: true", flush=True)
             return _cookies_path_cache
-        except (binascii.Error, OSError, ValueError):
+        except Exception as exc:
             _cookies_initialized = True
             _cookies_path_cache = None
-            logger.warning("YouTube cookies enabled: false (could not prepare cookies file)")
+            print("[YT Cookies] enabled: false", flush=True)
+            print("[YT Cookies] file created: false", flush=True)
+            print("[YT Cookies] error:", type(exc).__name__, flush=True)
             return None
 
 
-def get_youtube_cookies_path() -> Optional[str]:
-    """Snake-case alias for Python callers."""
-    return getYoutubeCookiesPath()
-
-
-def _build_ytdlp_subtitle_args(
-    video_id: str,
-    tmpdir: str,
-    cookies_path: Optional[str],
-) -> List[str]:
-    args = [
-        sys.executable,
-        "-m",
-        "yt_dlp",
-        "--write-subs",
-        "--write-auto-subs",
-        "--sub-langs",
-        "en,en-US",
-        "--sub-format",
-        "json3",
-        "--skip-download",
-        "--no-playlist",
-        "--output",
-        f"{tmpdir}/%(id)s",
-        "--quiet",
-        "--no-warnings",
-    ]
-    if cookies_path:
-        args.extend(["--cookies", cookies_path])
-    args.append(f"https://www.youtube.com/watch?v={video_id}")
-    return args
+def getYoutubeCookiesPath() -> Optional[str]:
+    """Backward-compatible alias for existing callers."""
+    return get_youtube_cookies_path()
 
 
 def _is_bot_verification_error(exc: Exception) -> bool:
@@ -206,6 +180,10 @@ def _extract_via_transcript_api(video_id: str) -> Optional[Tuple[str, str]]:
         _record_failure(video_id, reason)
         if reason == FAILURE_BOT_VERIFICATION:
             logger.warning("%s for video_id=%s", reason, video_id)
+        elif reason == FAILURE_TRANSCRIPT_TIMEOUT:
+            print(f"[Transcript] timeout: video_id={video_id}", flush=True)
+        else:
+            print(f"[Transcript] not available: video_id={video_id}", flush=True)
 
     return None
 
@@ -213,34 +191,47 @@ def _extract_via_transcript_api(video_id: str) -> Optional[Tuple[str, str]]:
 def _extract_via_ytdlp(video_id: str) -> Optional[Tuple[str, str]]:
     """Try yt-dlp subtitle download. Returns (text, type) or None."""
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cookies_path = getYoutubeCookiesPath()
-            args = _build_ytdlp_subtitle_args(video_id, tmpdir, cookies_path)
-            logger.warning("yt-dlp cookies enabled: %s", _bool_text(cookies_path))
+        import yt_dlp
 
-            completed = subprocess.run(
-                args,
-                capture_output=True,
-                text=True,
-                timeout=TRANSCRIPT_TIMEOUT,
-                check=False,
-            )
-            if completed.returncode != 0:
-                output = f"{completed.stderr or ''}\n{completed.stdout or ''}".strip()
-                reason = _classify_error(RuntimeError(output))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ydl_opts = {
+                "writesubtitles": True,
+                "writeautomaticsub": True,
+                "subtitleslangs": ["en", "en-US"],
+                "subtitlesformat": "json3",
+                "skip_download": True,
+                "noplaylist": True,
+                "outtmpl": os.path.join(tmpdir, "%(id)s"),
+                "quiet": True,
+                "no_warnings": True,
+                "socket_timeout": TRANSCRIPT_TIMEOUT,
+            }
+
+            cookies_path = get_youtube_cookies_path()
+            if cookies_path:
+                ydl_opts["cookiefile"] = cookies_path
+            print(f"[Transcript] yt-dlp cookies enabled: {_bool_text(cookies_path)}", flush=True)
+
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    retcode = ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+                    if retcode:
+                        raise RuntimeError(f"yt-dlp exited with status {retcode}")
+            except Exception as exc:
+                reason = _classify_error(exc)
                 _record_failure(video_id, reason)
                 if reason == FAILURE_BOT_VERIFICATION:
-                    logger.warning(
-                        "%s for video_id=%s; cookies enabled: %s",
-                        reason,
-                        video_id,
-                        _bool_text(cookies_path),
-                    )
+                    print(f"[Transcript] yt-dlp bot verification blocked: video_id={video_id}", flush=True)
+                elif reason == FAILURE_TRANSCRIPT_TIMEOUT:
+                    print(f"[Transcript] timeout: video_id={video_id}", flush=True)
+                else:
+                    print(f"[Transcript] extraction failed: video_id={video_id} error={type(exc).__name__}", flush=True)
                 return None
 
-            sub_files = glob.glob(f"{tmpdir}/*.json3")
+            sub_files = glob.glob(os.path.join(tmpdir, "*.json3"))
             if not sub_files:
                 _record_failure(video_id, FAILURE_TRANSCRIPT_NOT_AVAILABLE)
+                print(f"[Transcript] not available: video_id={video_id}", flush=True)
                 return None
 
             # Determine type from filename
@@ -261,21 +252,21 @@ def _extract_via_ytdlp(video_id: str) -> Optional[Tuple[str, str]]:
                         texts.append(t)
 
             text = " ".join(texts).strip()
+            if not text:
+                _record_failure(video_id, FAILURE_TRANSCRIPT_NOT_AVAILABLE)
+                print(f"[Transcript] not available: video_id={video_id}", flush=True)
+                return None
             return (text, kind) if text else None
 
-    except subprocess.TimeoutExpired:
-        _record_failure(video_id, FAILURE_TRANSCRIPT_TIMEOUT)
-        logger.warning("%s for video_id=%s via yt-dlp", FAILURE_TRANSCRIPT_TIMEOUT, video_id)
     except Exception as exc:
         reason = _classify_error(exc)
         _record_failure(video_id, reason)
         if reason == FAILURE_BOT_VERIFICATION:
-            logger.warning(
-                "%s for video_id=%s; cookies enabled: %s",
-                reason,
-                video_id,
-                _bool_text(_cookies_path_cache),
-            )
+            print(f"[Transcript] yt-dlp bot verification blocked: video_id={video_id}", flush=True)
+        elif reason == FAILURE_TRANSCRIPT_TIMEOUT:
+            print(f"[Transcript] timeout: video_id={video_id}", flush=True)
+        else:
+            print(f"[Transcript] extraction failed: video_id={video_id} error={type(exc).__name__}", flush=True)
 
     return None
 
@@ -338,11 +329,20 @@ def _extract_single(video_id: str) -> Optional[Tuple[str, str]]:
             _record_failure(video_id, reason)
             if reason == FAILURE_BOT_VERIFICATION:
                 logger.warning("%s for video_id=%s", reason, video_id)
+            elif reason == FAILURE_TRANSCRIPT_TIMEOUT:
+                print(f"[Transcript] timeout: video_id={video_id}", flush=True)
+            else:
+                print(
+                    f"[Transcript] extraction failed: video_id={video_id} "
+                    f"error={type(exc_holder[0]).__name__}",
+                    flush=True,
+                )
 
         if result_holder[0]:
             return result_holder[0]
 
     _record_failure(video_id, FAILURE_TRANSCRIPT_NOT_AVAILABLE)
+    print(f"[Transcript] not available: video_id={video_id}", flush=True)
     return None
 
 
