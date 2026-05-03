@@ -8,7 +8,7 @@ import tempfile
 import threading
 from pathlib import Path
 from typing import Optional, Tuple, Dict, List
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 import httpx
 from dotenv import load_dotenv
@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 SUPADATA_API_KEY = os.getenv("SUPADATA_API_KEY", "")
-TRANSCRIPT_TIMEOUT = 20  # seconds per extraction attempt
+TRANSCRIPT_TIMEOUT = 8  # seconds per provider attempt
 _YT_COOKIES_PATH = "/tmp/youtube-cookies.txt"
 YT_COOKIES_PATH = _YT_COOKIES_PATH
 
@@ -139,6 +139,10 @@ def getTranscriptFailureReasons(video_ids: Optional[List[str]] = None) -> Dict[s
 def get_transcript_failure_reasons(video_ids: Optional[List[str]] = None) -> Dict[str, str]:
     """Snake-case alias for Python callers."""
     return getTranscriptFailureReasons(video_ids)
+
+
+def _log_provider_success(provider: str, video_id: str) -> None:
+    print(f"[Transcript] provider succeeded: {provider} video_id={video_id}", flush=True)
 
 
 def _extract_via_transcript_api(video_id: str) -> Optional[Tuple[str, str]]:
@@ -276,7 +280,7 @@ def _extract_via_supadata(video_id: str) -> Optional[Tuple[str, str]]:
     if not SUPADATA_API_KEY:
         return None
     try:
-        with httpx.Client(timeout=30.0) as client:
+        with httpx.Client(timeout=TRANSCRIPT_TIMEOUT) as client:
             resp = client.get(
                 "https://api.supadata.ai/v1/youtube/transcript",
                 params={"videoId": video_id, "lang": "en"},
@@ -290,93 +294,188 @@ def _extract_via_supadata(video_id: str) -> Optional[Tuple[str, str]]:
                 else:
                     text = str(content).strip()
                 return (text, "fallback") if text else None
-    except Exception:
-        pass
+            _record_failure(video_id, FAILURE_TRANSCRIPT_NOT_AVAILABLE)
+    except Exception as exc:
+        reason = _classify_error(exc)
+        _record_failure(video_id, reason)
+        if reason == FAILURE_TRANSCRIPT_TIMEOUT:
+            print(f"[Transcript] timeout: video_id={video_id} provider=supadata", flush=True)
+        else:
+            print(
+                f"[Transcript] extraction failed: video_id={video_id} "
+                f"provider=supadata error={type(exc).__name__}",
+                flush=True,
+            )
     return None
 
 
 def _extract_single(video_id: str) -> Optional[Tuple[str, str]]:
     """
-    Try cheap extraction methods in sequence.
+    Try transcript providers in sequence for one video.
     Returns (text, type) or None within TRANSCRIPT_TIMEOUT seconds per attempt.
     """
-    for method in [_extract_via_transcript_api, _extract_via_ytdlp]:
-        result_holder: List[Optional[Tuple[str, str]]] = [None]
-        exc_holder: List[Optional[Exception]] = [None]
+    methods = []
+    if SUPADATA_API_KEY:
+        methods.append(("supadata", _extract_via_supadata))
+    methods.extend([
+        ("youtube_transcript_api", _extract_via_transcript_api),
+        ("yt_dlp", _extract_via_ytdlp),
+    ])
 
-        def run(m=method):
-            try:
-                result_holder[0] = m(video_id)
-            except Exception as e:
-                exc_holder[0] = e
-
-        t = threading.Thread(target=run, daemon=True)
-        t.start()
-        t.join(timeout=TRANSCRIPT_TIMEOUT)
-
-        if t.is_alive():
-            _record_failure(video_id, FAILURE_TRANSCRIPT_TIMEOUT)
-            logger.warning(
-                "%s for video_id=%s via %s",
-                FAILURE_TRANSCRIPT_TIMEOUT,
-                video_id,
-                method.__name__,
-            )
-            continue
-
-        if exc_holder[0]:
-            reason = _classify_error(exc_holder[0])
-            _record_failure(video_id, reason)
-            if reason == FAILURE_BOT_VERIFICATION:
-                logger.warning("%s for video_id=%s", reason, video_id)
-            elif reason == FAILURE_TRANSCRIPT_TIMEOUT:
-                print(f"[Transcript] timeout: video_id={video_id}", flush=True)
-            else:
-                print(
-                    f"[Transcript] extraction failed: video_id={video_id} "
-                    f"error={type(exc_holder[0]).__name__}",
-                    flush=True,
-                )
-
-        if result_holder[0]:
-            return result_holder[0]
+    for provider, method in methods:
+        result = _run_provider_with_timeout(provider, method, video_id)
+        if result:
+            _log_provider_success(provider, video_id)
+            return result
 
     _record_failure(video_id, FAILURE_TRANSCRIPT_NOT_AVAILABLE)
     print(f"[Transcript] not available: video_id={video_id}", flush=True)
     return None
 
 
+def _run_provider_with_timeout(
+    provider: str,
+    method,
+    video_id: str,
+) -> Optional[Tuple[str, str]]:
+    result_holder: List[Optional[Tuple[str, str]]] = [None]
+    exc_holder: List[Optional[Exception]] = [None]
+
+    def run():
+        try:
+            result_holder[0] = method(video_id)
+        except Exception as exc:
+            exc_holder[0] = exc
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout=TRANSCRIPT_TIMEOUT)
+
+    if t.is_alive():
+        _record_failure(video_id, FAILURE_TRANSCRIPT_TIMEOUT)
+        print(f"[Transcript] timeout: video_id={video_id} provider={provider}", flush=True)
+        return None
+
+    if exc_holder[0]:
+        reason = _classify_error(exc_holder[0])
+        _record_failure(video_id, reason)
+        if reason == FAILURE_BOT_VERIFICATION:
+            print(f"[Transcript] yt-dlp bot verification blocked: video_id={video_id}", flush=True)
+        elif reason == FAILURE_TRANSCRIPT_TIMEOUT:
+            print(f"[Transcript] timeout: video_id={video_id} provider={provider}", flush=True)
+        else:
+            print(
+                f"[Transcript] extraction failed: video_id={video_id} "
+                f"provider={provider} error={type(exc_holder[0]).__name__}",
+                flush=True,
+            )
+        return None
+
+    if not result_holder[0]:
+        _record_failure(video_id, FAILURE_TRANSCRIPT_NOT_AVAILABLE)
+    return result_holder[0]
+
+
+def _extract_provider_parallel(
+    video_ids: List[str],
+    provider: str,
+    method,
+    max_concurrent: int,
+) -> Dict[str, Tuple[str, str]]:
+    executor = ThreadPoolExecutor(max_workers=max(1, max_concurrent))
+    pending = {}
+    remaining = iter(video_ids)
+    shutdown_started = False
+
+    def submit_next() -> bool:
+        try:
+            vid_id = next(remaining)
+        except StopIteration:
+            return False
+        pending[executor.submit(_run_provider_with_timeout, provider, method, vid_id)] = vid_id
+        return True
+
+    try:
+        for _ in range(min(max(1, max_concurrent), len(video_ids))):
+            submit_next()
+
+        while pending:
+            done, _ = wait(
+                pending.keys(),
+                timeout=TRANSCRIPT_TIMEOUT + 1,
+                return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                continue
+
+            success: Optional[Tuple[str, Tuple[str, str]]] = None
+            for future in done:
+                vid_id = pending.pop(future)
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    _record_failure(vid_id, _classify_error(exc))
+                    result = None
+
+                if result and not success:
+                    success = (vid_id, result)
+
+            if success:
+                vid_id, result = success
+                _log_provider_success(provider, vid_id)
+                for other in pending:
+                    other.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+                shutdown_started = True
+                return {vid_id: result}
+
+            if not pending:
+                for _ in range(min(max(1, max_concurrent), len(video_ids))):
+                    submit_next()
+
+        return {}
+    finally:
+        if not shutdown_started:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+
 def extract_transcripts_parallel(
-    video_ids: List[str], max_concurrent: int = 5
+    video_ids: List[str],
+    max_concurrent: int = 5,
+    supadata_limit: Optional[int] = None,
 ) -> Dict[str, Tuple[str, str]]:
     """
-    Extract transcripts for multiple videos in parallel (5 at a time).
-    Returns {video_id: (text, type)} for successes only.
+    Extract transcripts for scored videos. Returns after the first provider success.
     """
+    video_ids = list(video_ids)
     results: Dict[str, Tuple[str, str]] = {}
     with _failure_lock:
         for vid_id in video_ids:
             _last_failure_reasons.pop(vid_id, None)
 
-    with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
-        future_to_id = {
-            executor.submit(_extract_single, vid_id): vid_id
-            for vid_id in video_ids
-        }
-        try:
-            for future in as_completed(future_to_id, timeout=TRANSCRIPT_TIMEOUT * 4):
-                vid_id = future_to_id[future]
-                try:
-                    result = future.result(timeout=5)
-                    if result:
-                        results[vid_id] = result
-                except Exception as exc:
-                    _record_failure(vid_id, _classify_error(exc))
-        except FuturesTimeoutError:
-            for future, vid_id in future_to_id.items():
-                if not future.done():
-                    _record_failure(vid_id, FAILURE_TRANSCRIPT_TIMEOUT)
-                    logger.warning("%s for video_id=%s", FAILURE_TRANSCRIPT_TIMEOUT, vid_id)
+    print(f"[Transcript] candidate count: {len(video_ids)}", flush=True)
+    print(f"[Transcript] parallel limit: {max_concurrent}", flush=True)
+    print(f"[Transcript] timeout seconds: {TRANSCRIPT_TIMEOUT}", flush=True)
+    print(f"[Transcript] Supadata enabled: {_bool_text(SUPADATA_API_KEY)}", flush=True)
+
+    if SUPADATA_API_KEY:
+        supadata_ids = video_ids[:supadata_limit] if supadata_limit else video_ids
+        results = _extract_provider_parallel(
+            supadata_ids,
+            "supadata",
+            _extract_via_supadata,
+            max_concurrent,
+        )
+        if results:
+            return results
+
+    for provider, method in [
+        ("youtube_transcript_api", _extract_via_transcript_api),
+        ("yt_dlp", _extract_via_ytdlp),
+    ]:
+        results = _extract_provider_parallel(video_ids, provider, method, max_concurrent)
+        if results:
+            return results
 
     return results
 
@@ -387,5 +486,6 @@ def extract_supadata_batch(video_ids: List[str]) -> Dict[str, Tuple[str, str]]:
     for vid_id in video_ids:
         result = _extract_via_supadata(vid_id)
         if result:
+            _log_provider_success("supadata", vid_id)
             results[vid_id] = result
     return results

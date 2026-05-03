@@ -23,11 +23,14 @@ from app.services import (
 
 router = APIRouter()
 
-CANDIDATE_LIMIT = 20
+CANDIDATE_LIMIT = 10
 COLLECT_MAX_RESULTS = int(os.getenv("YOUTUBE_COLLECT_MAX_RESULTS", "50"))
-PARALLEL_LIMIT = 5
-SUPADATA_FALLBACK_COUNT = 3
-TRANSCRIPT_SCAN_LIMIT = int(os.getenv("TRANSCRIPT_SCAN_LIMIT", "40"))
+PARALLEL_LIMIT = 2
+SUPADATA_FALLBACK_COUNT = 10
+TRANSCRIPT_SCAN_LIMIT = max(
+    1,
+    min(int(os.getenv("TRANSCRIPT_SCAN_LIMIT", str(CANDIDATE_LIMIT))), CANDIDATE_LIMIT),
+)
 
 
 class GenerateRequest(BaseModel):
@@ -126,14 +129,30 @@ def _transcript_failure_message(primary_failure: str) -> str:
     return "Transcript not available for candidate videos."
 
 
-def _transcript_failure_hint(primary_failure: str) -> str:
+def _transcript_failure_hint(
+    primary_failure: str,
+    supadata_enabled: bool = False,
+    youtube_cookies_enabled: bool = False,
+) -> str:
     if primary_failure == transcript_extractor.FAILURE_BOT_VERIFICATION:
+        if youtube_cookies_enabled:
+            return (
+                "YouTube still blocked transcript access with cookies enabled. "
+                "Refresh YT_COOKIES_BASE64 and retry."
+            )
         return (
             "Set or refresh Render YT_COOKIES_BASE64 with a base64-encoded cookies.txt, "
             "then retry. The cookie contents are never returned in logs or API responses."
         )
     if primary_failure == transcript_extractor.FAILURE_TRANSCRIPT_TIMEOUT:
+        if supadata_enabled:
+            return (
+                "Transcript extraction timed out after trying available transcript providers. "
+                "Try fewer candidates or lower concurrency."
+            )
         return "Try again later, lower transcript concurrency, or configure SUPADATA_API_KEY for fallback transcripts."
+    if supadata_enabled:
+        return "Try again later or add channels with English captions."
     return "Try again later, add channels with English captions, or configure SUPADATA_API_KEY for fallback transcripts."
 
 
@@ -251,8 +270,15 @@ def generate_article(data: GenerateRequest, db: Session = Depends(get_db)):
     selected_transcript = None
     selected_type = None
     transcript_attempted = []
+    supadata_enabled = bool(transcript_extractor.SUPADATA_API_KEY)
+    youtube_cookies_enabled = bool(transcript_extractor.getYoutubeCookiesPath())
 
-    # 6-8. Try cheap transcript extraction in scored batches; use Supadata per batch.
+    print(f"[Transcript] candidate count: {len(transcript_candidates)}", flush=True)
+    print(f"[Transcript] parallel limit: {PARALLEL_LIMIT}", flush=True)
+    print(f"[Transcript] timeout seconds: {transcript_extractor.TRANSCRIPT_TIMEOUT}", flush=True)
+    print(f"[Transcript] Supadata enabled: {str(supadata_enabled).lower()}", flush=True)
+
+    # 6-8. Try transcript extraction in scored batches. Supadata runs first when configured.
     for start in range(0, len(transcript_candidates), CANDIDATE_LIMIT):
         batch = transcript_candidates[start:start + CANDIDATE_LIMIT]
         batch_ids = [v["youtube_video_id"] for v in batch]
@@ -261,23 +287,13 @@ def generate_article(data: GenerateRequest, db: Session = Depends(get_db)):
         transcripts = transcript_extractor.extract_transcripts_parallel(
             batch_ids,
             max_concurrent=PARALLEL_LIMIT,
+            supadata_limit=SUPADATA_FALLBACK_COUNT,
         )
 
         for candidate in batch:
             if candidate["youtube_video_id"] in transcripts:
                 selected_video = candidate
                 selected_transcript, selected_type = transcripts[candidate["youtube_video_id"]]
-                break
-
-        if selected_video:
-            break
-
-        fallback_ids = batch_ids[:SUPADATA_FALLBACK_COUNT]
-        fallback_results = transcript_extractor.extract_supadata_batch(fallback_ids)
-        for candidate in batch[:SUPADATA_FALLBACK_COUNT]:
-            if candidate["youtube_video_id"] in fallback_results:
-                selected_video = candidate
-                selected_transcript, selected_type = fallback_results[candidate["youtube_video_id"]]
                 break
 
         if selected_video:
@@ -302,14 +318,18 @@ def generate_article(data: GenerateRequest, db: Session = Depends(get_db)):
         db.commit()
         raise _pipeline_error(
             _transcript_failure_message(primary_failure),
-            _transcript_failure_hint(primary_failure),
+            _transcript_failure_hint(
+                primary_failure,
+                supadata_enabled=supadata_enabled,
+                youtube_cookies_enabled=youtube_cookies_enabled,
+            ),
             filter_counts=filter_counts,
             transcript_candidates=len(transcript_candidates),
             transcript_attempted=transcript_attempted,
             transcript_failure_reason=primary_failure,
             transcript_failure_reason_counts=failure_reason_counts,
-            supadata_enabled=bool(transcript_extractor.SUPADATA_API_KEY),
-            youtube_cookies_enabled=bool(transcript_extractor.getYoutubeCookiesPath()),
+            supadata_enabled=supadata_enabled,
+            youtube_cookies_enabled=youtube_cookies_enabled,
         )
 
     # 10. Save / update video record
