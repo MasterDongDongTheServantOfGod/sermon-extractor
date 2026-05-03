@@ -103,8 +103,18 @@ def _rebuild_articles():
             index_entries.append(entry)
 
         index_path = os.path.join("data", "articles-index.json")
+        try:
+            with open(index_path, "r", encoding="utf-8") as f:
+                current_index = _json.load(f)
+        except (FileNotFoundError, _json.JSONDecodeError):
+            current_index = {}
+
+        if "articles" in current_index and current_index.get("articles", []) == index_entries:
+            return
+
         with open(index_path, "w", encoding="utf-8") as f:
             _json.dump({"articles": index_entries, "updated_at": _dt.utcnow().isoformat()}, f, indent=2, ensure_ascii=False)
+            f.write("\n")
     finally:
         db.close()
 
