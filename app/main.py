@@ -1,5 +1,5 @@
 from dotenv import load_dotenv
-load_dotenv(override=True)
+load_dotenv(override=False)
 
 import json
 import os
@@ -9,11 +9,14 @@ from fastapi.responses import FileResponse
 
 from app.database import Base, engine, SessionLocal
 from app.routers import articles, channels, videos
+from app.services import transcript_extractor
 
 Base.metadata.create_all(bind=engine)
 
 os.makedirs("articles", exist_ok=True)
 os.makedirs("data", exist_ok=True)
+
+transcript_extractor.getYoutubeCookiesPath()
 
 
 def _seed_channels():

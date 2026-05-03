@@ -107,6 +107,36 @@ def _pipeline_error(message: str, hint: str, **diagnostics):
     )
 
 
+def _primary_transcript_failure(reason_counts: dict) -> str:
+    for reason in [
+        transcript_extractor.FAILURE_BOT_VERIFICATION,
+        transcript_extractor.FAILURE_TRANSCRIPT_TIMEOUT,
+        transcript_extractor.FAILURE_TRANSCRIPT_NOT_AVAILABLE,
+    ]:
+        if reason_counts.get(reason):
+            return reason
+    return transcript_extractor.FAILURE_TRANSCRIPT_NOT_AVAILABLE
+
+
+def _transcript_failure_message(primary_failure: str) -> str:
+    if primary_failure == transcript_extractor.FAILURE_BOT_VERIFICATION:
+        return "YouTube bot verification blocked yt-dlp access."
+    if primary_failure == transcript_extractor.FAILURE_TRANSCRIPT_TIMEOUT:
+        return "Transcript extraction timeout."
+    return "Transcript not available for candidate videos."
+
+
+def _transcript_failure_hint(primary_failure: str) -> str:
+    if primary_failure == transcript_extractor.FAILURE_BOT_VERIFICATION:
+        return (
+            "Set or refresh Render YT_COOKIES_BASE64 with a base64-encoded cookies.txt, "
+            "then retry. The cookie contents are never returned in logs or API responses."
+        )
+    if primary_failure == transcript_extractor.FAILURE_TRANSCRIPT_TIMEOUT:
+        return "Try again later, lower transcript concurrency, or configure SUPADATA_API_KEY for fallback transcripts."
+    return "Try again later, add channels with English captions, or configure SUPADATA_API_KEY for fallback transcripts."
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -255,22 +285,31 @@ def generate_article(data: GenerateRequest, db: Session = Depends(get_db)):
 
     # 9. No transcript found → record failures and bail
     if not selected_video or not selected_transcript:
+        failure_reasons = transcript_extractor.getTranscriptFailureReasons(transcript_attempted)
+        failure_reason_counts = {}
+        for reason in failure_reasons.values():
+            failure_reason_counts[reason] = failure_reason_counts.get(reason, 0) + 1
+        primary_failure = _primary_transcript_failure(failure_reason_counts)
+
         for candidate in transcript_candidates[:5]:
             vid_id = candidate["youtube_video_id"]
             existing = db.query(FailedTranscript).filter(FailedTranscript.youtube_video_id == vid_id).first()
             if not existing:
                 db.add(FailedTranscript(
                     youtube_video_id=vid_id,
-                    reason="No usable transcript found from any method",
+                    reason=primary_failure,
                 ))
         db.commit()
         raise _pipeline_error(
-            "No usable transcript found for any candidate video.",
-            "Try again later, add channels with English captions, or configure SUPADATA_API_KEY for fallback transcripts.",
+            _transcript_failure_message(primary_failure),
+            _transcript_failure_hint(primary_failure),
             filter_counts=filter_counts,
             transcript_candidates=len(transcript_candidates),
             transcript_attempted=transcript_attempted,
+            transcript_failure_reason=primary_failure,
+            transcript_failure_reason_counts=failure_reason_counts,
             supadata_enabled=bool(transcript_extractor.SUPADATA_API_KEY),
+            youtube_cookies_enabled=bool(transcript_extractor.getYoutubeCookiesPath()),
         )
 
     # 10. Save / update video record

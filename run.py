@@ -1,6 +1,6 @@
 """Entry point: python run.py"""
 from dotenv import load_dotenv
-load_dotenv(override=True)
+load_dotenv(override=False)
 
 import os
 import uvicorn
