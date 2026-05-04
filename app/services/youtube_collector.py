@@ -147,3 +147,46 @@ def collect_recent_videos(raw_channel_id: str, max_results: int = 30) -> List[Di
         })
 
     return results
+
+
+def collect_top_comments(video_id: str, max_results: int = 100, top_n: int = 5) -> List[Dict]:
+    """
+    Collect a small editorial sample of top YouTube comments for one selected video.
+
+    The caller should pass these to GPT as aggregate audience context only. Do not
+    quote commenters or include usernames in generated copy.
+    """
+    if not YOUTUBE_API_KEY:
+        raise RuntimeError("YOUTUBE_API_KEY not set")
+
+    youtube = _build_client()
+    comments = []
+    next_page_token = None
+
+    while len(comments) < max_results:
+        batch_size = min(100, max_results - len(comments))
+        response = youtube.commentThreads().list(
+            part="snippet",
+            videoId=video_id,
+            order="relevance",
+            maxResults=batch_size,
+            textFormat="plainText",
+            pageToken=next_page_token,
+        ).execute()
+
+        for item in response.get("items", []):
+            snippet = item.get("snippet", {}).get("topLevelComment", {}).get("snippet", {})
+            text = (snippet.get("textDisplay") or "").strip()
+            if not text:
+                continue
+            comments.append({
+                "text": text,
+                "like_count": int(snippet.get("likeCount", 0) or 0),
+            })
+
+        next_page_token = response.get("nextPageToken")
+        if not next_page_token:
+            break
+
+    comments.sort(key=lambda item: item["like_count"], reverse=True)
+    return comments[:top_n]

@@ -1,6 +1,6 @@
 import os
 import json
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -58,6 +58,36 @@ Return ONLY a JSON object with fields:
 title, deck, article_body, primary_scripture, seo_title, meta_description, tags (string array)
 """
 
+_BEFORE_WATCH_SYSTEM = """\
+You are a Christian editorial writer creating a "Before You Watch" guide.
+
+The goal is not to fully summarize the sermon. The goal is to help readers decide
+why the original video is worth watching and what to listen for when they open it.
+
+Write the piece following this exact structure:
+1. Title: "Why This Sermon Is Worth Watching: [Pastor Name] on [Theme]"
+2. Why this sermon is worth watching
+3. Recommended for viewers who...
+4. The central question this sermon raises
+5. Insight for modern Christian life
+6. Community Response
+7. What to watch for in the original sermon
+8. Reflection Questions
+9. Watch the Original Sermon
+
+For the Community Response section, use the provided YouTube comment notes only
+as aggregate audience context. Do not quote comments verbatim. Do not mention
+usernames. Do not write "one user said" or similar attribution. Describe the
+shared sentiment, points of resonance, and spiritual response editorially.
+
+Avoid giving away every argument or turning the piece into a full sermon recap.
+Use specific enough details to create interest, but keep directing the reader
+back to the original video. Target ~{word_count} words.
+
+Return ONLY a JSON object with fields:
+title, deck, article_body, primary_scripture, seo_title, meta_description, tags (string array)
+"""
+
 
 def generate_article(
     mode: str,
@@ -73,9 +103,10 @@ def generate_article(
     keywords: List[str],
     main_theme: str,
     word_count: int = 500,
+    community_comments: Optional[List[Dict[str, object]]] = None,
 ) -> Dict:
     """
-    Generate a news article or devotional blog with GPT.
+    Generate a news article, devotional blog, or Before You Watch guide with GPT.
     Returns dict with article fields + token usage/cost.
     """
     if not OPENAI_API_KEY:
@@ -83,8 +114,24 @@ def generate_article(
 
     client = OpenAI(api_key=OPENAI_API_KEY)
 
-    system_template = _NEWS_SYSTEM if mode == "news" else _BLOG_SYSTEM
+    system_templates = {
+        "news": _NEWS_SYSTEM,
+        "blog": _BLOG_SYSTEM,
+        "before_watch": _BEFORE_WATCH_SYSTEM,
+    }
+    system_template = system_templates.get(mode, _BLOG_SYSTEM)
     system_prompt = system_template.format(word_count=word_count)
+
+    comment_context = "No YouTube comment context available."
+    if community_comments:
+        safe_comments = [
+            {
+                "text": str(item.get("text", ""))[:500],
+                "like_count": item.get("like_count", 0),
+            }
+            for item in community_comments[:5]
+        ]
+        comment_context = json.dumps(safe_comments, indent=2, ensure_ascii=False)
 
     user_content = f"""
 Pastor: {pastor_name}
@@ -102,6 +149,10 @@ Strong Quotes:
 Keywords: {', '.join(keywords)}
 Video URL: {video_url}
 Transcript Quality: {transcript_quality}
+Content Mode: {mode}
+
+YouTube Comment Context for Community Response:
+{comment_context}
 
 Write the article now.
 """.strip()
@@ -127,8 +178,11 @@ Write the article now.
     try:
         data = json.loads(response.choices[0].message.content)
     except (json.JSONDecodeError, AttributeError):
+        fallback_title = f"{pastor_name}: {sermon_title}"
+        if mode == "before_watch":
+            fallback_title = f"Why This Sermon Is Worth Watching: {pastor_name} on {main_theme or sermon_title}"
         data = {
-            "title": f"{pastor_name}: {sermon_title}",
+            "title": fallback_title,
             "deck": main_theme,
             "article_body": response.choices[0].message.content or "",
             "primary_scripture": primary_scripture,

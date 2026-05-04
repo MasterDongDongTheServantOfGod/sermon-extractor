@@ -31,7 +31,7 @@ TRANSCRIPT_SCAN_LIMIT = max(
 
 
 class GenerateRequest(BaseModel):
-    mode: str = "news"   # news | blog
+    mode: str = "news"   # news | blog | before_watch
     word_count: int = 500
 
 
@@ -105,6 +105,21 @@ def _pipeline_error(message: str, hint: str, **diagnostics):
             "diagnostics": diagnostics,
         },
     )
+
+
+def _collect_before_watch_comments(video_id: str) -> tuple[list[dict], Optional[str]]:
+    try:
+        comments = youtube_collector.collect_top_comments(
+            video_id,
+            max_results=100,
+            top_n=5,
+        )
+        print(f"[Comments] selected for before_watch: {len(comments)}", flush=True)
+        return comments, None
+    except Exception as exc:
+        error = type(exc).__name__
+        print(f"[Comments] unavailable for before_watch: {error}", flush=True)
+        return [], error
 
 
 def _primary_transcript_failure(reason_counts: dict) -> str:
@@ -380,6 +395,12 @@ def generate_article(data: GenerateRequest, db: Session = Depends(get_db)):
         else ""
     )
     video_url = f"https://www.youtube.com/watch?v={selected_video['youtube_video_id']}"
+    community_comments = []
+    comment_collection_error = None
+    if data.mode == "before_watch":
+        community_comments, comment_collection_error = _collect_before_watch_comments(
+            selected_video["youtube_video_id"],
+        )
 
     gpt_result = openai_writer.generate_article(
         mode=data.mode,
@@ -395,6 +416,7 @@ def generate_article(data: GenerateRequest, db: Session = Depends(get_db)):
         keywords=gemini_result.get("keywords", []),
         main_theme=gemini_result.get("main_theme", ""),
         word_count=data.word_count,
+        community_comments=community_comments,
     )
 
     # 13. SEO score
@@ -464,11 +486,14 @@ def generate_article(data: GenerateRequest, db: Session = Depends(get_db)):
         "scores": {
             "seo_score": seo_result["seo_score"],
             "seo_checks": seo_result["checks"],
+            "seo_components": seo_result.get("components", []),
             "risk_level": risk_result.get("risk_level"),
             "risk_status": risk_result.get("status"),
             "reviewer_notes": risk_result.get("reviewer_notes", []),
             "quote_accuracy": risk_result.get("quote_accuracy"),
             "scripture_accuracy": risk_result.get("scripture_accuracy"),
+            "community_comments_used": len(community_comments),
+            "community_comments_error": comment_collection_error,
         },
         "cost_breakdown": {
             "gemini": round(gemini_result.get("cost", 0.0), 6),

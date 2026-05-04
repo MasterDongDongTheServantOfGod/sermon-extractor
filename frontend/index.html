@@ -67,6 +67,7 @@
     .btn-outline { background: transparent; border: 1px solid var(--border); color: #374151; }
     .btn-news { background: #1d4ed8; color: #fff; }
     .btn-blog { background: var(--gold); color: #fff; }
+    .btn-before { background: #0f766e; color: #fff; }
     .btn-publish { background: var(--green); color: #fff; padding: 7px 14px; font-size: 0.85em; }
     .btn-sm { padding: 5px 10px; font-size: 0.82em; }
 
@@ -89,6 +90,7 @@
     .badge-published { background: #d1fae5; color: #065f46; }
     .badge-news { background: #dbeafe; color: #1e40af; }
     .badge-blog { background: #fef3c7; color: #92400e; }
+    .badge-before_watch { background: #ccfbf1; color: #115e59; }
     .badge-manual { background: #d1fae5; color: #065f46; }
     .badge-auto { background: #e0e7ff; color: #3730a3; }
     .badge-fallback { background: #fef3c7; color: #92400e; }
@@ -119,6 +121,16 @@
     .score-item { background: #f3f4f6; border-radius: 6px; padding: 8px 14px; text-align: center; }
     .score-item .val { font-size: 1.4em; font-weight: 700; }
     .score-item .lbl { font-size: 0.72em; color: var(--gray); margin-top: 1px; }
+    .seo-radar {
+      display: none; background: #f9fafb; border: 1px solid var(--border);
+      border-radius: 6px; padding: 12px; margin-bottom: 14px;
+    }
+    .seo-radar.show { display: block; }
+    .seo-radar-title { font-size: 0.8em; font-weight: 700; color: var(--gray); margin-bottom: 8px; }
+    .seo-radar-wrap { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+    .seo-radar svg { width: 210px; height: 210px; flex-shrink: 0; }
+    .seo-radar-list { display: grid; grid-template-columns: repeat(2, minmax(150px, 1fr)); gap: 6px 14px; font-size: 0.82em; flex: 1; }
+    .seo-radar-list div { display: flex; justify-content: space-between; gap: 10px; color: #374151; }
     .article-preview-body {
       max-height: 400px; overflow-y: auto; background: #f9fafb;
       border: 1px solid var(--border); border-radius: 6px; padding: 16px;
@@ -238,6 +250,9 @@
             <button class="btn btn-blog" onclick="generateArticle('blog')">
               ✍️ Generate Devotional Blog
             </button>
+            <button class="btn btn-before" onclick="generateArticle('before_watch')">
+              Before You Watch
+            </button>
           </div>
         </div>
         <p style="font-size:0.82em;color:var(--gray);margin-top:10px;">
@@ -297,6 +312,14 @@
             <div class="score-item">
               <div class="val" id="sc-vidScore">—</div>
               <div class="lbl">Video Score</div>
+            </div>
+          </div>
+
+          <div class="seo-radar" id="seo-radar">
+            <div class="seo-radar-title">SEO Scoring Breakdown</div>
+            <div class="seo-radar-wrap">
+              <div id="seo-radar-chart"></div>
+              <div class="seo-radar-list" id="seo-radar-list"></div>
             </div>
           </div>
 
@@ -398,11 +421,63 @@ function statusBadge(s) {
   return `<span class="badge ${cls}">${s||'?'}</span>`;
 }
 function modeBadge(m) {
-  return `<span class="badge badge-${m}">${m}</span>`;
+  const labels = {news: 'news', blog: 'blog', before_watch: 'before watch'};
+  return `<span class="badge badge-${m}">${labels[m] || m}</span>`;
 }
 function transcriptBadge(t) {
   const cls = {manual:'badge-manual',auto:'badge-auto',fallback:'badge-fallback'}[t] || '';
   return t ? `<span class="badge ${cls}">${t}</span>` : '—';
+}
+function renderSeoRadar(components) {
+  const box = document.getElementById('seo-radar');
+  const chart = document.getElementById('seo-radar-chart');
+  const list = document.getElementById('seo-radar-list');
+  if (!box || !chart || !list || !components?.length) {
+    if (box) box.classList.remove('show');
+    return;
+  }
+
+  const cx = 105;
+  const cy = 105;
+  const radius = 68;
+  const labelRadius = 90;
+  const count = components.length;
+  const pointFor = (index, valueRadius) => {
+    const angle = (-90 + (360 / count) * index) * Math.PI / 180;
+    return [
+      cx + Math.cos(angle) * valueRadius,
+      cy + Math.sin(angle) * valueRadius
+    ];
+  };
+  const outer = components.map((_, i) => pointFor(i, radius).join(',')).join(' ');
+  const inner = components.map((item, i) => {
+    const pct = Math.max(0, Math.min(100, Number(item.percent || 0))) / 100;
+    return pointFor(i, radius * pct).join(',');
+  }).join(' ');
+  const axes = components.map((_, i) => {
+    const [x, y] = pointFor(i, radius);
+    return `<line x1="${cx}" y1="${cy}" x2="${x}" y2="${y}" stroke="#d1d5db" stroke-width="1" />`;
+  }).join('');
+  const labels = components.map((item, i) => {
+    const [x, y] = pointFor(i, labelRadius);
+    return `<text x="${x}" y="${y}" text-anchor="middle" dominant-baseline="middle" font-size="9" fill="#4b5563">${esc(item.label || item.key)}</text>`;
+  }).join('');
+
+  chart.innerHTML = `
+    <svg viewBox="0 0 210 210" role="img" aria-label="SEO scoring radar">
+      <polygon points="${outer}" fill="none" stroke="#cbd5e1" stroke-width="1.5" />
+      ${axes}
+      <polygon points="${inner}" fill="rgba(26,107,58,0.22)" stroke="#1a6b3a" stroke-width="2" />
+      ${labels}
+    </svg>
+  `;
+  list.innerHTML = components.map(item => `
+    <div>
+      <span>${esc(item.label || item.key)}</span>
+      <strong>${Number(item.score || 0)}/${Number(item.max || 0)}</strong>
+    </div>
+  `).join('');
+  box.classList.add('show');
 }
 function showAlert(id, msg, type='error') {
   const el = document.getElementById(id);
@@ -436,7 +511,7 @@ async function readApiError(res, fallback='Pipeline failed.') {
   }
 }
 function setGenerateBusy(isBusy) {
-  document.querySelectorAll('.btn-news, .btn-blog').forEach(btn => {
+  document.querySelectorAll('.btn-news, .btn-blog, .btn-before').forEach(btn => {
     btn.disabled = isBusy;
   });
 }
@@ -506,15 +581,20 @@ async function deleteChannel(id) {
 
 // ===== GENERATE =====
 function loadingSteps(mode) {
+  const writingStep = {
+    blog: 'Transcript found. Generating blog…',
+    news: 'Transcript found. Generating news article…',
+    before_watch: 'Transcript found. Building Before You Watch guide…'
+  }[mode] || 'Transcript found. Generating article…';
+
   return [
     'Collecting recent videos from channels…',
     'Scoring and filtering candidates…',
     'Finding a sermon with usable transcript…',
     'Standard transcript search failed. Trying deeper extraction…',
-    mode === 'blog'
-      ? 'Transcript found. Generating blog…'
-      : 'Transcript found. Generating news article…',
+    writingStep,
     'Summarizing with Gemini Flash Lite…',
+    mode === 'before_watch' ? 'Reading community response…' : 'Preparing source context…',
     'Writing article with GPT-4.1-mini…',
     'Running SEO scorer…',
     'Running risk review…',
@@ -600,6 +680,7 @@ function renderPreview(data) {
   document.getElementById('sc-status').innerHTML = statusBadge(scores.risk_status || article.risk_status);
   document.getElementById('sc-transcript').innerHTML = transcriptBadge(video?.transcript_type);
   document.getElementById('sc-vidScore').textContent = video?.score != null ? Math.round(video.score) : '—';
+  renderSeoRadar(scores.seo_components || []);
 
   const notes = scores.reviewer_notes || article.reviewer_notes || [];
   if (notes.length) {
