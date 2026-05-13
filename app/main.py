@@ -3,26 +3,29 @@ load_dotenv(override=False)
 
 import json
 import os
+import traceback
 from pathlib import Path
 
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
-
-_PUBLIC_DIR = Path(__file__).parent.parent / "public"
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import FileResponse, JSONResponse
 
 from app.database import Base, SessionLocal, engine
 from app.routers import articles, channels, videos
 
-Base.metadata.create_all(bind=engine)
+BASE_DIR = Path(__file__).resolve().parent
+ADMIN_HTML_PATH = BASE_DIR / "admin.html"
 
 
 def _seed_channels():
-    seed_path = os.path.join("data", "channels_seed.json")
-    if not os.path.exists(seed_path):
+    seed_path = BASE_DIR.parent / "data" / "channels_seed.json"
+    if not seed_path.exists():
         return
+
     from app.models import Channel
-    with open(seed_path, "r", encoding="utf-8") as f:
+
+    with seed_path.open("r", encoding="utf-8") as f:
         seeds = json.load(f)
+
     db = SessionLocal()
     try:
         for s in seeds:
@@ -39,11 +42,10 @@ def _seed_channels():
         db.close()
 
 
-_seed_channels()
+def init_database():
+    Base.metadata.create_all(bind=engine)
+    _seed_channels()
 
-# Render used cold-start filesystem generation for /articles and
-# data/articles-index.json. Vercel functions have ephemeral storage, so published
-# articles are served dynamically from the database instead.
 
 app = FastAPI(title="Sermon Extractor", version="1.0.0")
 
@@ -57,8 +59,32 @@ def health():
     return {"ok": True}
 
 
+@app.post("/api/admin/init-db")
+def init_db_route(x_admin_token: str = Header(default="")):
+    expected = os.getenv("ADMIN_INIT_TOKEN", "")
+
+    if expected and x_admin_token != expected:
+        raise HTTPException(status_code=403, detail="Invalid admin token")
+
+    try:
+        init_database()
+        return {"ok": True, "message": "Database initialized"}
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 def _admin_response():
-    response = FileResponse(str(_PUBLIC_DIR / "index.html"))
+    if not ADMIN_HTML_PATH.exists():
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "Admin HTML not found",
+                "expected_path": str(ADMIN_HTML_PATH),
+            },
+        )
+
+    response = FileResponse(str(ADMIN_HTML_PATH))
     response.headers["Cache-Control"] = "no-store"
     return response
 
