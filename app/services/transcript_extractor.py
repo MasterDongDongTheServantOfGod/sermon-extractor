@@ -16,18 +16,26 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
 SUPADATA_API_KEY = os.getenv("SUPADATA_API_KEY", "")
 TRANSCRIPT_TIMEOUT = 8  # seconds per provider attempt
 FAST_PROVIDER_TIMEOUT = 5
 SUPADATA_TIMEOUT = 5
 YTDLP_SOCKET_TIMEOUT = 15
-FAST_CANDIDATE_LIMIT = 30
-DEEP_CANDIDATE_START = 30
-DEEP_CANDIDATE_LIMIT = 20
-FAST_PARALLEL_LIMIT = 4
-DEEP_PARALLEL_LIMIT = 2
-DEEP_YTDLP_LIMIT = 5
-DEEP_SUPADATA_LIMIT = 3
+FAST_CANDIDATE_LIMIT = _env_int("FAST_CANDIDATE_LIMIT", _env_int("CANDIDATE_LIMIT", 8))
+DEEP_CANDIDATE_START = FAST_CANDIDATE_LIMIT
+DEEP_CANDIDATE_LIMIT = _env_int("DEEP_CANDIDATE_LIMIT", _env_int("CANDIDATE_LIMIT", 8))
+FAST_PARALLEL_LIMIT = _env_int("FAST_PARALLEL_LIMIT", _env_int("PARALLEL_LIMIT", 2))
+DEEP_PARALLEL_LIMIT = _env_int("DEEP_PARALLEL_LIMIT", _env_int("PARALLEL_LIMIT", 2))
+DEEP_YTDLP_LIMIT = _env_int("DEEP_YTDLP_LIMIT", 2)
+DEEP_SUPADATA_LIMIT = _env_int("SUPADATA_FALLBACK_COUNT", _env_int("DEEP_SUPADATA_LIMIT", 2))
 SUPADATA_COOLDOWN_SECONDS = 600
 _YT_COOKIES_PATH = "/tmp/youtube-cookies.txt"
 YT_COOKIES_PATH = _YT_COOKIES_PATH
@@ -81,7 +89,7 @@ def _bool_text(value: object) -> str:
 
 def get_youtube_cookies_path() -> Optional[str]:
     """
-    Decode Render-provided YouTube cookies into a temporary cookies.txt file.
+    Decode deployment-provided YouTube cookies into a temporary cookies.txt file.
 
     Returns the temporary path when YT_COOKIES_BASE64 is configured and valid,
     otherwise returns None. Cookie contents are never logged.

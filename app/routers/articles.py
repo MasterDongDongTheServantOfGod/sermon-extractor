@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session, joinedload
 
@@ -23,10 +23,19 @@ from app.services import (
 
 router = APIRouter()
 
-COLLECT_MAX_RESULTS = int(os.getenv("YOUTUBE_COLLECT_MAX_RESULTS", "50"))
+
+def _env_int(name: str, default: int, minimum: int = 1, maximum: int = 50) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+COLLECT_MAX_RESULTS = _env_int("YOUTUBE_COLLECT_MAX_RESULTS", 8)
 TRANSCRIPT_SCAN_LIMIT = max(
     1,
-    min(int(os.getenv("TRANSCRIPT_SCAN_LIMIT", "50")), 50),
+    min(_env_int("TRANSCRIPT_SCAN_LIMIT", _env_int("CANDIDATE_LIMIT", 8)), 50),
 )
 
 
@@ -38,6 +47,18 @@ class GenerateRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _public_article_path(article_id: int) -> str:
+    return f"/api/articles/public/{article_id}"
+
+
+def _html_path_for_response(a: Article) -> Optional[str]:
+    if a.status != "published":
+        return a.html_path
+    if not a.html_path or a.html_path.startswith("/articles/"):
+        return _public_article_path(a.id)
+    return a.html_path
+
 
 def _serialize_article(a: Article) -> dict:
     tags = json.loads(a.tags) if a.tags else []
@@ -60,7 +81,7 @@ def _serialize_article(a: Article) -> dict:
         "risk_status": a.risk_status,
         "reviewer_notes": reviewer_notes,
         "total_cost": a.total_cost,
-        "html_path": a.html_path,
+        "html_path": _html_path_for_response(a),
         "created_at": a.created_at.isoformat() if a.created_at else None,
         "published_at": a.published_at.isoformat() if a.published_at else None,
         "costs": [
@@ -153,7 +174,7 @@ def _transcript_failure_hint(
                 "Refresh YT_COOKIES_BASE64 and retry."
             )
         return (
-            "Set or refresh Render YT_COOKIES_BASE64 with a base64-encoded cookies.txt, "
+            "Set or refresh YT_COOKIES_BASE64 with a base64-encoded cookies.txt, "
             "then retry. The cookie contents are never returned in logs or API responses."
         )
     if primary_failure == transcript_extractor.FAILURE_TRANSCRIPT_TIMEOUT:
@@ -528,7 +549,7 @@ def list_articles(db: Session = Depends(get_db)):
             "risk_status": a.risk_status,
             "total_cost": a.total_cost,
             "tags": tags,
-            "html_path": a.html_path,
+            "html_path": _html_path_for_response(a),
             "created_at": a.created_at.isoformat() if a.created_at else None,
             "published_at": a.published_at.isoformat() if a.published_at else None,
             "video": {
@@ -539,6 +560,50 @@ def list_articles(db: Session = Depends(get_db)):
             } if video else None,
         })
     return result
+
+
+@router.get("/public/{article_id}", response_class=HTMLResponse)
+def public_article(article_id: int, db: Session = Depends(get_db)):
+    article = (
+        db.query(Article)
+        .options(joinedload(Article.video).joinedload(Video.channel))
+        .filter(Article.id == article_id, Article.status == "published")
+        .first()
+    )
+    if not article:
+        raise HTTPException(404, "Published article not found")
+
+    tags = json.loads(article.tags) if article.tags else []
+    video = article.video
+    channel = video.channel if video else None
+    published_date = (
+        article.published_at.strftime("%B %d, %Y")
+        if article.published_at
+        else (
+            video.published_at.strftime("%B %d, %Y")
+            if (video and video.published_at)
+            else ""
+        )
+    )
+
+    html = static_publisher.render_article_html(
+        title=article.title or "",
+        deck=article.deck or "",
+        article_body=article.article_body or "",
+        primary_scripture=article.primary_scripture or "",
+        seo_title=article.seo_title or article.title or "",
+        meta_description=article.meta_description or "",
+        tags=tags,
+        pastor_name=channel.pastor_name if channel else "Unknown",
+        church_name=channel.channel_title if channel else "",
+        sermon_title=video.title if video else "",
+        video_url=f"https://www.youtube.com/watch?v={video.youtube_video_id}" if video else "",
+        image_url=video.thumbnail_url if video else "",
+        published_date=published_date,
+        seo_score=article.seo_score or 0,
+        risk_level=article.risk_level or "LOW",
+    )
+    return HTMLResponse(html)
 
 
 @router.get("/{article_id}")
@@ -570,39 +635,19 @@ def publish_article_route(article_id: int, db: Session = Depends(get_db)):
     if article.status == "published":
         raise HTTPException(400, "Article already published")
 
-    tags = json.loads(article.tags) if article.tags else []
-    video = article.video
-    channel = video.channel if video else None
-
-    result = static_publisher.publish_article(
-        article_id=article.id,
-        title=article.title or "",
-        deck=article.deck or "",
-        article_body=article.article_body or "",
-        primary_scripture=article.primary_scripture or "",
-        seo_title=article.seo_title or article.title or "",
-        meta_description=article.meta_description or "",
-        tags=tags,
-        pastor_name=channel.pastor_name if channel else "Unknown",
-        church_name=channel.channel_title if channel else "",
-        sermon_title=video.title if video else "",
-        video_url=f"https://www.youtube.com/watch?v={video.youtube_video_id}" if video else "",
-        thumbnail_url=video.thumbnail_url if video else "",
-        published_date=(
-            video.published_at.strftime("%B %d, %Y")
-            if (video and video.published_at)
-            else ""
-        ),
-        seo_score=article.seo_score or 0,
-        risk_level=article.risk_level or "LOW",
-    )
-
+    # Render wrote static HTML into /articles. On Vercel, keep publication state
+    # in Postgres/Supabase and render the public article from the database.
+    html_path = _public_article_path(article.id)
     article.status = "published"
-    article.html_path = result["html_path"]
+    article.html_path = html_path
     article.published_at = datetime.utcnow()
     db.commit()
 
-    return {"success": True, "html_path": result["html_path"], "slug": result["slug"]}
+    return {
+        "success": True,
+        "html_path": html_path,
+        "slug": static_publisher.slugify(article.title or f"article-{article.id}"),
+    }
 
 
 @router.delete("/{article_id}")

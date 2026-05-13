@@ -112,6 +112,10 @@ def _slugify(text: str) -> str:
     return text.strip("-")[:60]
 
 
+def slugify(text: str) -> str:
+    return _slugify(text)
+
+
 def _body_to_html(body: str) -> str:
     """Convert plain text / light markdown to HTML."""
     lines = body.split("\n")
@@ -131,6 +135,48 @@ def _body_to_html(body: str) -> str:
         else:
             html_parts.append(f"<p>{stripped}</p>")
     return "\n".join(html_parts)
+
+
+def render_article_html(
+    title: str,
+    deck: str,
+    article_body: str,
+    primary_scripture: str,
+    seo_title: str,
+    meta_description: str,
+    tags: List[str],
+    pastor_name: str,
+    church_name: str,
+    sermon_title: str,
+    video_url: str,
+    image_url: str,
+    published_date: str,
+    seo_score: int = 0,
+    risk_level: str = "LOW",
+) -> str:
+    """Render public article HTML without writing static files."""
+    article_body_html = _body_to_html(article_body)
+    risk_badge = {"LOW": "low", "MEDIUM": "med", "HIGH": "high"}.get(risk_level, "med")
+
+    template = Template(_ARTICLE_HTML)
+    return template.render(
+        title=title,
+        deck=deck,
+        article_body_html=article_body_html,
+        primary_scripture=primary_scripture,
+        seo_title=seo_title or title,
+        meta_description=meta_description,
+        tags=tags,
+        pastor_name=pastor_name,
+        church_name=church_name,
+        sermon_title=sermon_title,
+        video_url=video_url,
+        image_url=image_url,
+        published_date=published_date,
+        seo_score=seo_score,
+        risk_level=risk_level,
+        risk_badge=risk_badge,
+    )
 
 
 def _download_image(url: str, dest: str) -> bool:
@@ -180,69 +226,15 @@ def publish_article(
     seo_score: int = 0,
     risk_level: str = "LOW",
 ) -> Dict:
-    """Generate static HTML + metadata for a published article. Returns {slug, html_path}."""
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    """
+    Return dynamic publication metadata without writing files.
+
+    Render previously wrote static HTML, thumbnails, metadata.json, and
+    data/articles-index.json here. Vercel serves the article from the database at
+    /api/articles/public/{article_id}, so the filesystem writes are disabled.
+    """
     slug = _slugify(title)
-    dir_name = f"{timestamp}_{slug}"
-    article_dir = os.path.join("articles", dir_name)
-    os.makedirs(article_dir, exist_ok=True)
-
-    # Download thumbnail
-    image_relative = ""
-    if thumbnail_url:
-        img_path = os.path.join(article_dir, "image.jpg")
-        if _download_image(thumbnail_url, img_path):
-            image_relative = f"/articles/{dir_name}/image.jpg"
-
-    article_body_html = _body_to_html(article_body)
-    risk_badge = {"LOW": "low", "MEDIUM": "med", "HIGH": "high"}.get(risk_level, "med")
-
-    template = Template(_ARTICLE_HTML)
-    html = template.render(
-        title=title,
-        deck=deck,
-        article_body_html=article_body_html,
-        primary_scripture=primary_scripture,
-        seo_title=seo_title or title,
-        meta_description=meta_description,
-        tags=tags,
-        pastor_name=pastor_name,
-        church_name=church_name,
-        sermon_title=sermon_title,
-        video_url=video_url,
-        image_url=image_relative,
-        published_date=published_date,
-        seo_score=seo_score,
-        risk_level=risk_level,
-        risk_badge=risk_badge,
-    )
-
-    html_file = os.path.join(article_dir, "article.html")
-    with open(html_file, "w", encoding="utf-8") as fh:
-        fh.write(html)
-
-    metadata = {
-        "id": article_id,
-        "title": title,
-        "slug": slug,
-        "primary_scripture": primary_scripture,
-        "pastor_name": pastor_name,
-        "church_name": church_name,
-        "published_date": published_date,
-        "html_path": f"/articles/{dir_name}/article.html",
-        "image_url": image_relative,
-        "tags": tags,
-        "meta_description": meta_description,
-        "seo_score": seo_score,
-        "risk_level": risk_level,
-    }
-
-    with open(os.path.join(article_dir, "metadata.json"), "w", encoding="utf-8") as fh:
-        json.dump(metadata, fh, indent=2, ensure_ascii=False)
-
-    _update_index(metadata)
-
-    return {"slug": slug, "html_path": f"/articles/{dir_name}/article.html"}
+    return {"slug": slug, "html_path": f"/api/articles/public/{article_id}"}
 
 
 def rebuild_article_files(
@@ -264,45 +256,23 @@ def rebuild_article_files(
     seo_score: int = 0,
     risk_level: str = "LOW",
 ) -> Dict:
-    """Recreate static files for an existing article using its known dir_name."""
-    article_dir = os.path.join("articles", dir_name)
-    os.makedirs(article_dir, exist_ok=True)
+    """
+    Legacy compatibility shim.
 
-    image_relative = ""
-    if thumbnail_url:
-        img_path = os.path.join(article_dir, "image.jpg")
-        if not os.path.exists(img_path):
-            _download_image(thumbnail_url, img_path)
-        if os.path.exists(img_path):
-            image_relative = f"/articles/{dir_name}/image.jpg"
-
-    article_body_html = _body_to_html(article_body)
-    risk_badge = {"LOW": "low", "MEDIUM": "med", "HIGH": "high"}.get(risk_level, "med")
-
-    template = Template(_ARTICLE_HTML)
-    html = template.render(
-        title=title, deck=deck, article_body_html=article_body_html,
-        primary_scripture=primary_scripture, seo_title=seo_title or title,
-        meta_description=meta_description, tags=tags,
-        pastor_name=pastor_name, church_name=church_name,
-        sermon_title=sermon_title, video_url=video_url,
-        image_url=image_relative, published_date=published_date,
-        seo_score=seo_score, risk_level=risk_level, risk_badge=risk_badge,
-    )
-
-    with open(os.path.join(article_dir, "article.html"), "w", encoding="utf-8") as fh:
-        fh.write(html)
-
+    Render rebuilt static files from the database during cold starts. That is
+    disabled for Vercel; callers receive dynamic-route metadata only.
+    """
+    slug = dir_name.split("_", 2)[-1] if dir_name.count("_") >= 2 else slugify(title)
     return {
         "id": article_id,
         "title": title,
-        "slug": dir_name.split("_", 2)[-1] if dir_name.count("_") >= 2 else dir_name,
+        "slug": slug,
         "primary_scripture": primary_scripture,
         "pastor_name": pastor_name,
         "church_name": church_name,
         "published_date": published_date,
-        "html_path": f"/articles/{dir_name}/article.html",
-        "image_url": image_relative,
+        "html_path": f"/api/articles/public/{article_id}",
+        "image_url": thumbnail_url,
         "tags": tags,
         "meta_description": meta_description,
         "seo_score": seo_score,
