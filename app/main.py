@@ -3,9 +3,12 @@ load_dotenv(override=False)
 
 import json
 import os
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
+
+_PUBLIC_DIR = Path(__file__).parent.parent / "public"
 
 from app.database import Base, SessionLocal, engine
 from app.routers import articles, channels, videos
@@ -55,7 +58,7 @@ def health():
 
 
 def _admin_response():
-    response = FileResponse("public/index.html")
+    response = FileResponse(str(_PUBLIC_DIR / "index.html"))
     response.headers["Cache-Control"] = "no-store"
     return response
 
